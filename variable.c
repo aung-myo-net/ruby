@@ -965,16 +965,33 @@ gen_ivtbl_bytes(size_t n)
 }
 
 static struct gen_ivtbl *
-gen_ivtbl_resize(struct gen_ivtbl *old, uint32_t n)
+gen_ivtbl_resize(struct gen_ivtbl *old, uint32_t new_numiv)
 {
-    RUBY_ASSERT(n > 0);
+    RUBY_ASSERT(new_numiv > 0);
 
-    uint32_t len = old ? old->numiv : 0;
-    struct gen_ivtbl *ivtbl = xrealloc(old, gen_ivtbl_bytes(n));
+    uint32_t numiv_capa = old ? old->numiv_capa : 2;
+    if (old) {
+        if (new_numiv > old->numiv_capa) {
+            do {
+                numiv_capa = numiv_capa * 2;
+            } while (numiv_capa < new_numiv);
+        }
+    }
 
-    ivtbl->numiv = n;
-    for (; len < n; len++) {
-        ivtbl->ivptr[len] = Qundef;
+    struct gen_ivtbl *ivtbl = old;
+    bool resized = false;
+    if (!old || numiv_capa > old->numiv_capa) {
+        ivtbl = xrealloc(old, gen_ivtbl_bytes(numiv_capa));
+        resized = true;
+    }
+
+    ivtbl->numiv = new_numiv;
+    ivtbl->numiv_capa = numiv_capa;
+    uint32_t len = new_numiv;
+    if (resized) {
+        for (; len < numiv_capa; len++) {
+            ivtbl->ivptr[len] = Qundef;
+        }
     }
 
     return ivtbl;
@@ -1001,14 +1018,17 @@ generic_ivar_update(st_data_t *k, st_data_t *v, st_data_t u, int existing)
     struct ivar_update *ivup = (struct ivar_update *)u;
     struct gen_ivtbl *ivtbl = 0;
 
+    // this ivtbl already exists
     if (existing) {
         ivtbl = (struct gen_ivtbl *)*v;
+        /* this ivar index already exists */
         if (ivup->iv_index < ivtbl->numiv) {
             ivup->ivtbl = ivtbl;
             return ST_STOP;
         }
     }
-    FL_SET((VALUE)*k, FL_EXIVAR);
+    /* new ivar set on object */
+    FL_SET((VALUE)*k, FL_EXIVAR); /* in case this flag's not set already (first ivar for object) */
     ivtbl = gen_ivtbl_resize(ivtbl, ivup->shape->next_iv_index);
     // Reinsert in to the hash table because ivtbl might be a newly resized chunk of memory
     *v = (st_data_t)ivtbl;
@@ -1361,6 +1381,7 @@ rb_ensure_iv_list_size(VALUE obj, uint32_t current_capacity, uint32_t new_capaci
     VALUE *ptr = ROBJECT_IVPTR(obj);
     VALUE *newptr;
 
+    /* if embedded, unembed */
     if (RBASIC(obj)->flags & ROBJECT_EMBED) {
         newptr = obj_ivar_heap_alloc(obj, new_capacity);
         MEMCPY(newptr, ptr, VALUE, current_capacity);
@@ -1373,15 +1394,18 @@ rb_ensure_iv_list_size(VALUE obj, uint32_t current_capacity, uint32_t new_capaci
 }
 
 struct gen_ivtbl *
-rb_ensure_generic_iv_list_size(VALUE obj, uint32_t newsize)
+rb_ensure_generic_iv_list_size(VALUE obj, uint32_t new_numiv)
 {
     struct gen_ivtbl * ivtbl = 0;
 
     RB_VM_LOCK_ENTER();
     {
-        if (UNLIKELY(!gen_ivtbl_get_unlocked(obj, 0, &ivtbl) || newsize > ivtbl->numiv)) {
-            ivtbl = gen_ivtbl_resize(ivtbl, newsize);
-            st_insert(generic_ivtbl_no_ractor_check(obj), (st_data_t)obj, (st_data_t)ivtbl);
+        if (UNLIKELY(!gen_ivtbl_get_unlocked(obj, 0, &ivtbl) || new_numiv > ivtbl->numiv)) {
+            struct gen_ivtbl * old_ivtbl = ivtbl;
+            ivtbl = gen_ivtbl_resize(ivtbl, new_numiv);
+            if (ivtbl != old_ivtbl) {
+                st_insert(generic_ivtbl_no_ractor_check(obj), (st_data_t)obj, (st_data_t)ivtbl);
+            }
             FL_SET_RAW(obj, FL_EXIVAR);
         }
     }

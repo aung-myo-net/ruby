@@ -15,6 +15,7 @@ struct gen_ivtbl {
     uint16_t shape_id;
 #endif
     uint32_t numiv;
+    uint32_t numiv_capa;
     VALUE ivptr[FLEX_ARY_LEN];
 };
 
