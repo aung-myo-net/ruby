@@ -233,16 +233,6 @@ clean_hooks(const rb_execution_context_t *ec, rb_hook_list_t *list)
             nextp = &hook->next;
         }
     }
-
-    if (list->is_local) {
-        if (list->events == 0) {
-            /* local events */
-            ruby_xfree(list);
-        }
-    }
-    else {
-        update_global_event_hook(prev_events, list->events);
-    }
 }
 
 static void

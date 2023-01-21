@@ -198,6 +198,7 @@ rb_iseq_free(const rb_iseq_t *iseq)
 
     if (iseq && ISEQ_EXECUTABLE_P(iseq) && iseq->aux.exec.local_hooks) {
         rb_hook_list_free(iseq->aux.exec.local_hooks);
+        xfree(iseq->aux.exec.local_hooks);
     }
 
     RUBY_FREE_LEAVE("iseq");
@@ -3422,7 +3423,6 @@ iseq_add_local_tracepoint(const rb_iseq_t *iseq, rb_event_flag_t turnon_events, 
     if (n > 0) {
         if (iseq->aux.exec.local_hooks == NULL) {
             ((rb_iseq_t *)iseq)->aux.exec.local_hooks = RB_ZALLOC(rb_hook_list_t);
-            iseq->aux.exec.local_hooks->is_local = true;
         }
         rb_hook_list_connect_tracepoint((VALUE)iseq, iseq->aux.exec.local_hooks, tpval, target_line);
     }
@@ -3478,6 +3478,7 @@ iseq_remove_local_tracepoint(const rb_iseq_t *iseq, VALUE tpval)
 
         if (local_events == 0) {
             rb_hook_list_free(iseq->aux.exec.local_hooks);
+            xfree(iseq->aux.exec.local_hooks);
             ((rb_iseq_t *)iseq)->aux.exec.local_hooks = NULL;
         }
 

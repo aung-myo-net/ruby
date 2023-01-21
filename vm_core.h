@@ -609,7 +609,6 @@ typedef struct rb_hook_list_struct {
     rb_event_flag_t events;
     unsigned int running;
     bool need_clean;
-    bool is_local;
 } rb_hook_list_t;
 
 
