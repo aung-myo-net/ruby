@@ -426,6 +426,25 @@ class TestSetTraceFunc < Test::Unit::TestCase
     end
   end
 
+  def test_enable_in_multiple_threads_concurrently
+    r1 = Ractor.new do
+      tp = TracePoint.new(:line) {} # local to ractor
+      30.times do
+        tp.enable
+        tp.disable
+      end
+    end
+    r2 = Ractor.new do
+      tp = TracePoint.new(:line) {} # local to ractor
+      30.times do
+        tp.enable
+        tp.disable
+      end
+    end
+    [r1, r2].each(&:take) # shouldn't raise
+    assert true
+  end
+
   def test_trace_defined_method
     events = []
     name = "#{self.class}\##{__method__}"
@@ -2373,7 +2392,7 @@ CODE
     e = assert_raise(ArgumentError) do
       TracePoint.new(:line){}.enable(target_line: 10){}
     end
-    assert_equal 'only target_line is specified', e.message
+    assert_equal 'target_line is specified, but target is not specified', e.message
 
     e = assert_raise(ArgumentError) do
       TracePoint.new(:call){}.enable(target: code1, target_line: 10){}

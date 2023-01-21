@@ -43,6 +43,7 @@
 #include "builtin.h"
 #include "insns.inc"
 #include "insns_info.inc"
+#include "vm_sync.h"
 
 VALUE rb_cISeq;
 static VALUE iseqw_new(const rb_iseq_t *iseq);
@@ -3598,9 +3599,12 @@ trace_set_i(void *vstart, void *vend, size_t stride, void *data)
     return 0;
 }
 
+/* Expensive call and repercussions, as it iterates over all objects and changes all iseq instructions
+ * to the trace variant and invalidates call caches */
 void
 rb_iseq_trace_set_all(rb_event_flag_t turnon_events)
 {
+    ASSERT_vm_locking();
     rb_objspace_each_objects(trace_set_i, &turnon_events);
 }
 
