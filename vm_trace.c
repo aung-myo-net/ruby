@@ -78,23 +78,46 @@ rb_hook_list_mark_and_update(rb_hook_list_t *hooks)
     }
 }
 
-static void clean_hooks(const rb_execution_context_t *ec, rb_hook_list_t *list);
+static bool clean_hooks(const rb_execution_context_t *ec, rb_hook_list_t *list, bool clean_all);
 
-void
-rb_hook_list_free_hooks(rb_hook_list_t *hooks)
+bool
+rb_hook_list_free_deleted_hooks(rb_hook_list_t *hooks)
 {
     VM_ASSERT(hooks);
+    bool cleaned_all = false;
     RB_VM_LOCK_ENTER();
     {
         hooks->need_clean = true;
 
         if (hooks->running == 0) {
-            clean_hooks(GET_EC(), hooks);
+            cleaned_all = clean_hooks(GET_EC(), hooks, false);
         }
     }
     RB_VM_LOCK_LEAVE();
+    return cleaned_all;
+}
 
+void
+rb_hook_list_free_all_hooks(rb_hook_list_t *hooks)
+{
+    VM_ASSERT(hooks);
+    RB_VM_LOCK_ENTER();
+    {
+        if (hooks->running == 0) {
+            clean_hooks(GET_EC(), hooks, true);
+        }
+    }
+    RB_VM_LOCK_LEAVE();
+}
 
+void
+rb_hook_list_free_all_hooks_nogvl(rb_hook_list_t *hooks)
+{
+    VM_ASSERT(hooks);
+    VM_ASSERT(!hooks->running);
+    hooks->need_clean = true;
+    // called without VM lock, only called from ractor_free so unnecessary to lock
+    clean_hooks(GET_EC(), hooks, true);
 }
 
 /* ruby_vm_event_flags management */
@@ -239,8 +262,8 @@ rb_add_event_hook2(rb_event_hook_func_t func, rb_event_flag_t events, VALUE data
 
 }
 
-static void
-clean_hooks(const rb_execution_context_t *ec, rb_hook_list_t *list)
+static bool
+clean_hooks(const rb_execution_context_t *ec, rb_hook_list_t *list, bool clean_all)
 {
     VM_ASSERT(list);
     rb_event_hook_t *hook, **nextp = &list->hooks;
@@ -254,9 +277,10 @@ clean_hooks(const rb_execution_context_t *ec, rb_hook_list_t *list)
     /*fprintf(stderr, "clean hooks (list: %p), (hooks: %p): local? %c\n",*/
             /*list, list->hooks,*/
             /*list->local ? 't' : 'f');*/
+    bool cleaned_all = true;
     while ((hook = *nextp) != 0) {
         /*fprintf(stderr, "dereferncing hook\n");*/
-        if (hook->hook_flags & RUBY_EVENT_HOOK_FLAG_DELETED) {
+        if (clean_all || hook->hook_flags & RUBY_EVENT_HOOK_FLAG_DELETED) {
             /*fprintf(stderr, "/dereferncing hook\n");*/
             *nextp = hook->next;
             /*fprintf(stderr, "xfree hook\n");*/
@@ -264,39 +288,33 @@ clean_hooks(const rb_execution_context_t *ec, rb_hook_list_t *list)
             /*fprintf(stderr, "/xfree hook\n");*/
         }
         else {
+            cleaned_all = false;
             /*fprintf(stderr, "list->events\n");*/
             list->events |= hook->events; /* update active events */
             /*fprintf(stderr, "/list->events\n");*/
             nextp = &hook->next;
         }
     }
-
-    if (list->freeable) {
-        /*fprintf(stderr, "Freeing hooks in list: (list: %p), (hooks: %p)\n", list, list->hooks);*/
-        xfree(list->hooks);
-        list->hooks = NULL;
-        /*fprintf(stderr, "/Freeing hooks in list\n");*/
-    } else {
-        list->hooks = NULL;
-    }
+    return cleaned_all;
     /*fprintf(stderr, "called clean_hook for (list: %p), hooks: %p\n", list, list->hooks);*/
 }
 
-static void
+static bool
 clean_hooks_check(const rb_execution_context_t *ec, rb_hook_list_t *list)
 {
+    bool cleaned_all = false;
     RB_VM_LOCK_ENTER();
     {
-        if (UNLIKELY(list->need_clean && list->hooks && !list->freed)) {
+        if (UNLIKELY(list->need_clean && list->hooks)) {
             if (list->running == 0) {
                 /*fprintf(stderr, "Cleaning hooks: (list: %p), (hooks: %p), local? %c\n", list,*/
                 /*list->hooks, list->local ? 't' : 'f');*/
-                clean_hooks(ec, list);
+                cleaned_all = clean_hooks(ec, list, false);
             }
         }
     }
     RB_VM_LOCK_LEAVE();
-
+    return cleaned_all;
 }
 
 #define MATCH_ANY_FILTER_TH ((rb_thread_t *)1)
@@ -315,21 +333,20 @@ remove_event_hook(const rb_execution_context_t *ec, const rb_thread_t *filter_th
 
     RB_VM_LOCK_ENTER();
     {
-
-    while (hook) {
-        if (func == 0 || hook->func == func) {
-            if (hook->filter.th == filter_th || filter_th == MATCH_ANY_FILTER_TH) {
-                if (UNDEF_P(data) || hook->data == data) {
-                    hook->hook_flags |= RUBY_EVENT_HOOK_FLAG_DELETED;
-                    ret+=1;
-                    list->need_clean = true;
+        while (hook) {
+            if (func == 0 || hook->func == func) {
+                if (hook->filter.th == filter_th || filter_th == MATCH_ANY_FILTER_TH) {
+                    if (UNDEF_P(data) || hook->data == data) {
+                        hook->hook_flags |= RUBY_EVENT_HOOK_FLAG_DELETED;
+                        ret+=1;
+                        list->need_clean = true;
+                    }
                 }
             }
+            hook = hook->next;
         }
-        hook = hook->next;
-    }
 
-    clean_hooks_check(ec, list);
+        clean_hooks_check(ec, list);
     }
     RB_VM_LOCK_LEAVE();
     return ret;
@@ -383,7 +400,6 @@ static void
 exec_hooks_body(const rb_execution_context_t *ec, rb_hook_list_t *list, const rb_trace_arg_t *trace_arg)
 {
     rb_event_hook_t *hook;
-    if (list->freed) return;
 
     /*fprintf(stderr, "Executing hooks (list: %p), (hooks: %p): local ? %c\n", list, list->hooks, list->local ? 't' : 'f');*/
 
@@ -406,7 +422,7 @@ static int
 exec_hooks_precheck(const rb_execution_context_t *ec, rb_hook_list_t *list, const rb_trace_arg_t *trace_arg)
 {
     if (list->events & trace_arg->event) {
-        list->running++;
+        list->running++; // TODO: due to ractors this should be protected by RB_VM_LOCK
         return TRUE;
     }
     else {
@@ -417,7 +433,7 @@ exec_hooks_precheck(const rb_execution_context_t *ec, rb_hook_list_t *list, cons
 static void
 exec_hooks_postcheck(const rb_execution_context_t *ec, rb_hook_list_t *list)
 {
-    list->running--;
+    list->running--; // TODO: due to ractors this should be protected by RB_VM_LOCK.
     clean_hooks_check(ec, list);
 }
 
@@ -437,6 +453,8 @@ exec_hooks_protected(rb_execution_context_t *ec, rb_hook_list_t *list, const rb_
 
     if (exec_hooks_precheck(ec, list, trace_arg) == 0) return 0;
 
+    rb_hook_list_t **list_pp = &list;
+
     raised = rb_ec_reset_raised(ec);
 
     /* TODO: Support !RUBY_EVENT_HOOK_FLAG_SAFE hooks */
@@ -447,7 +465,10 @@ exec_hooks_protected(rb_execution_context_t *ec, rb_hook_list_t *list, const rb_
     }
     EC_POP_TAG();
 
-    exec_hooks_postcheck(ec, list);
+    if (*list_pp == list) {
+        // The hooks list hasn't been freed during the hook execution (TracePoint#disable wasn't called)
+        exec_hooks_postcheck(ec, list);
+    }
 
     if (raised) {
         rb_ec_set_raised(ec);
@@ -1363,8 +1384,8 @@ disable_local_event_iseq_i(VALUE target, VALUE iseq_p, VALUE tpval)
         VM_ASSERT(hooks != NULL);
         rb_hook_list_remove_tracepoint(hooks, tpval);
 
-        if (hooks->events == 0) {
-            rb_hook_list_free_hooks(def->body.bmethod.hooks);
+        if (rb_hook_list_free_deleted_hooks(def->body.bmethod.hooks)) {
+            xfree(def->body.bmethod.hooks);
             def->body.bmethod.hooks = NULL;
         }
     }

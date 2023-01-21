@@ -237,7 +237,7 @@ ractor_free(void *ptr)
     ractor_queue_free(&r->sync.incoming_queue);
     ractor_waiting_list_free(&r->sync.taking_ractors);
     ractor_local_storage_free(r);
-    rb_hook_list_free_hooks(&r->pub.hooks);
+    rb_hook_list_free_all_hooks_nogvl(&r->pub.hooks);
     ruby_xfree(r);
 }
 
@@ -1579,7 +1579,6 @@ ractor_init(rb_ractor_t *r, VALUE name, VALUE loc)
     }
     r->name = name;
     r->loc = loc;
-    r->pub.hooks.freeable = false;
     r->pub.hooks.local = false;
 }
 

@@ -440,7 +440,7 @@ class TestSetTraceFunc < Test::Unit::TestCase
         tp = TracePoint.new(:line) { } # local to ractor
         100.times do
           tp.enable(target: method(meth)) # change iseq internals of given method, should be done with lock
-          tp.disable
+          tp.disable # disable hooks should hold lock too, changes method definition internals
         end
       end
     end

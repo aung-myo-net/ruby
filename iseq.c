@@ -199,7 +199,8 @@ rb_iseq_free(const rb_iseq_t *iseq)
 
     if (iseq && ISEQ_EXECUTABLE_P(iseq) && iseq->aux.exec.local_hooks) {
         if (iseq->aux.exec.local_hooks) {
-            rb_hook_list_free_hooks(iseq->aux.exec.local_hooks);
+            RUBY_ASSERT(!iseq->aux.exec.local_hooks->running);
+            rb_hook_list_free_all_hooks(iseq->aux.exec.local_hooks);
             xfree(iseq->aux.exec.local_hooks);
         }
     }
@@ -3426,7 +3427,6 @@ iseq_add_local_tracepoint(const rb_iseq_t *iseq, rb_event_flag_t turnon_events, 
     if (n > 0) {
         if (iseq->aux.exec.local_hooks == NULL) {
             ((rb_iseq_t *)iseq)->aux.exec.local_hooks = RB_ZALLOC(rb_hook_list_t);
-            iseq->aux.exec.local_hooks->freeable = true;
             iseq->aux.exec.local_hooks->local = true;
         }
         rb_hook_list_connect_tracepoint((VALUE)iseq, iseq->aux.exec.local_hooks, tpval, target_line);
@@ -3483,12 +3483,14 @@ iseq_remove_local_tracepoint(const rb_iseq_t *iseq, VALUE tpval)
         local_events = iseq->aux.exec.local_hooks->events;
 
         if (local_events == 0) {
-            rb_hook_list_free_hooks(iseq->aux.exec.local_hooks);
+            iseq->aux.exec.local_hooks->running = 0; // Even if the hook is running it's now disabled so we can free it
+            rb_hook_list_free_all_hooks(iseq->aux.exec.local_hooks);
             /*fprintf(stderr, "Freeing local hooks from iseq (list: %p)\n", iseq->aux.exec.local_hooks);*/
-            ((rb_iseq_t *)iseq)->aux.exec.local_hooks->freed = true;
             xfree(iseq->aux.exec.local_hooks);
             /*fprintf(stderr, "/Freeing local hooks from iseq\n");*/
             ((rb_iseq_t *)iseq)->aux.exec.local_hooks = NULL;
+        } else {
+            rb_hook_list_free_deleted_hooks(iseq->aux.exec.local_hooks);
         }
 
         local_events = add_bmethod_events(local_events);
