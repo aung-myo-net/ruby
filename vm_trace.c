@@ -137,13 +137,11 @@ update_global_event_hook(rb_event_flag_t prev_events, rb_event_flag_t new_events
 
     // Modify ISEQs or CCs to enable tracing
     if (first_time_iseq_events_p) {
-        /*fprintf(stderr, "first_time_iseq_events_p\n");*/
         // write all ISeqs only when new events are added for the first time
         rb_iseq_trace_set_all(new_iseq_events | enabled_iseq_events);
     }
     // if c_call or c_return is activated
     else if (enable_c_call || enable_c_return) {
-        /*fprintf(stderr, "not first time iseq events p\n");*/
         rb_clear_attr_ccs();
     }
 
@@ -171,7 +169,6 @@ alloc_event_hook(rb_event_hook_func_t func, rb_event_flag_t events, VALUE data, 
 {
     rb_event_hook_t *hook;
 
-    // FIXME: I don't think this is even possible, and it's untested
     if ((events & RUBY_INTERNAL_EVENT_MASK) && (events & ~RUBY_INTERNAL_EVENT_MASK)) {
         rb_raise(rb_eTypeError, "Can not specify normal event and internal event simultaneously.");
     }
@@ -242,14 +239,12 @@ rb_add_event_hook(rb_event_hook_func_t func, rb_event_flag_t events, VALUE data)
     rb_add_event_hook2(func, events, data, RUBY_EVENT_HOOK_FLAG_SAFE);
 }
 
-// NOTE: can't raise
 void
 rb_thread_add_event_hook2(VALUE thval, rb_event_hook_func_t func, rb_event_flag_t events, VALUE data, rb_event_hook_flag_t hook_flags)
 {
     rb_threadptr_add_event_hook(GET_EC(), rb_thread_ptr(thval), func, events, data, hook_flags);
 }
 
-// NOTE: can't raise
 void
 rb_add_event_hook2(rb_event_hook_func_t func, rb_event_flag_t events, VALUE data, rb_event_hook_flag_t hook_flags)
 {
@@ -274,29 +269,19 @@ clean_hooks(const rb_execution_context_t *ec, rb_hook_list_t *list, bool clean_a
     list->events = 0;
     list->need_clean = false;
 
-    /*fprintf(stderr, "clean hooks (list: %p), (hooks: %p): local? %c\n",*/
-            /*list, list->hooks,*/
-            /*list->local ? 't' : 'f');*/
     bool cleaned_all = true;
     while ((hook = *nextp) != 0) {
-        /*fprintf(stderr, "dereferncing hook\n");*/
         if (clean_all || hook->hook_flags & RUBY_EVENT_HOOK_FLAG_DELETED) {
-            /*fprintf(stderr, "/dereferncing hook\n");*/
             *nextp = hook->next;
-            /*fprintf(stderr, "xfree hook\n");*/
             xfree(hook);
-            /*fprintf(stderr, "/xfree hook\n");*/
         }
         else {
             cleaned_all = false;
-            /*fprintf(stderr, "list->events\n");*/
             list->events |= hook->events; /* update active events */
-            /*fprintf(stderr, "/list->events\n");*/
             nextp = &hook->next;
         }
     }
     return cleaned_all;
-    /*fprintf(stderr, "called clean_hook for (list: %p), hooks: %p\n", list, list->hooks);*/
 }
 
 static bool
@@ -307,8 +292,6 @@ clean_hooks_check(const rb_execution_context_t *ec, rb_hook_list_t *list)
     {
         if (UNLIKELY(list->need_clean && list->hooks)) {
             if (list->running == 0) {
-                /*fprintf(stderr, "Cleaning hooks: (list: %p), (hooks: %p), local? %c\n", list,*/
-                /*list->hooks, list->local ? 't' : 'f');*/
                 cleaned_all = clean_hooks(ec, list, false);
             }
         }
@@ -400,8 +383,6 @@ static void
 exec_hooks_body(const rb_execution_context_t *ec, rb_hook_list_t *list, const rb_trace_arg_t *trace_arg)
 {
     rb_event_hook_t *hook;
-
-    /*fprintf(stderr, "Executing hooks (list: %p), (hooks: %p): local ? %c\n", list, list->hooks, list->local ? 't' : 'f');*/
 
     for (hook = list->hooks; hook; hook = hook->next) {
         if (!(hook->hook_flags & RUBY_EVENT_HOOK_FLAG_DELETED) &&
@@ -1400,7 +1381,6 @@ rb_tracepoint_disable(VALUE tpval)
     tp = tpptr(tpval);
 
     if (tp->local_target_set) {
-        /*fprintf(stderr, "tracepoint_disable hash foreach\n");*/
         RB_VM_LOCK_ENTER()
         {
             rb_hash_foreach(tp->local_target_set, disable_local_event_iseq_i, tpval);
@@ -1411,11 +1391,9 @@ rb_tracepoint_disable(VALUE tpval)
     }
     else {
         if (tp->target_th) {
-            /*fprintf(stderr, "remove_event_hook_with_data\n");*/
             rb_thread_remove_event_hook_with_data(tp->target_th->self, (rb_event_hook_func_t)tp_call_trace, tpval);
         }
         else {
-            /*fprintf(stderr, "remove_event_hook_with_data 2\n");*/
             rb_remove_event_hook_with_data((rb_event_hook_func_t)tp_call_trace, tpval);
         }
     }

@@ -3472,7 +3472,6 @@ iseq_remove_local_tracepoint(const rb_iseq_t *iseq, VALUE tpval)
 {
     int n = 0;
 
-    /*fprintf(stderr, "iseq_remove_local_tracepoint\n");*/
     if (iseq->aux.exec.local_hooks) {
         unsigned int pc;
         const struct rb_iseq_constant_body *const body = ISEQ_BODY(iseq);
@@ -3483,11 +3482,10 @@ iseq_remove_local_tracepoint(const rb_iseq_t *iseq, VALUE tpval)
         local_events = iseq->aux.exec.local_hooks->events;
 
         if (local_events == 0) {
-            iseq->aux.exec.local_hooks->running = 0; // Even if the hook is running it's now disabled so we can free it
+            // Even if the hook is running it's now disabled (TracePoint#disable) so we can free it
+            iseq->aux.exec.local_hooks->running = 0;
             rb_hook_list_free_all_hooks(iseq->aux.exec.local_hooks);
-            /*fprintf(stderr, "Freeing local hooks from iseq (list: %p)\n", iseq->aux.exec.local_hooks);*/
             xfree(iseq->aux.exec.local_hooks);
-            /*fprintf(stderr, "/Freeing local hooks from iseq\n");*/
             ((rb_iseq_t *)iseq)->aux.exec.local_hooks = NULL;
         } else {
             rb_hook_list_free_deleted_hooks(iseq->aux.exec.local_hooks);
