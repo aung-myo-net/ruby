@@ -2641,6 +2641,32 @@ CODE
     EOS
   end
 
+  def test_tracepoint_not_disabled_by_ractor_gc
+    events = []
+    tracepoint = TracePoint.new(:line) { |tp|
+      events << [tp.path, tp.lineno, tp.event]
+    }.tap(&:enable)
+
+    r = Ractor.new { 10 }
+    r.take
+    ractor_id = r.object_id
+    r = nil # allow gc for ractor
+    gc_times = 0
+    # force GC of ractor
+    until (ObjectSpace._id2ref(ractor_id) rescue nil).nil?
+      GC.start
+      gc_times += 1
+    end # tracepoints should still be enabled after ractor gc
+
+    5.times {
+      # we're checking path of '<internal:gc> calls (GC.start calls)'
+      GC.start
+    }
+    tracepoint.disable
+    gc_times += 5
+    assert_equal gc_times, events.select { |e| e[0] =~ /internal:gc/}.size
+  end
+
   def test_stat_exists
     assert_instance_of Hash, TracePoint.stat
   end

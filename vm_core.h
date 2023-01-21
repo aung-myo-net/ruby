@@ -609,6 +609,9 @@ typedef struct rb_hook_list_struct {
     rb_event_flag_t events;
     unsigned int running;
     bool need_clean;
+    bool freeable;
+    bool freed;
+    bool local;
 } rb_hook_list_t;
 
 
@@ -2015,7 +2018,7 @@ struct rb_trace_arg_struct {
 
 void rb_hook_list_mark(rb_hook_list_t *hooks);
 void rb_hook_list_mark_and_update(rb_hook_list_t *hooks);
-void rb_hook_list_free(rb_hook_list_t *hooks);
+void rb_hook_list_free_hooks(rb_hook_list_t *hooks);
 void rb_hook_list_connect_tracepoint(VALUE target, rb_hook_list_t *list, VALUE tpval, unsigned int target_line);
 void rb_hook_list_remove_tracepoint(rb_hook_list_t *list, VALUE tpval);
 

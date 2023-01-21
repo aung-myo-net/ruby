@@ -31,6 +31,7 @@
 #include "vm_core.h"
 #include "ruby/ractor.h"
 #include "yjit.h"
+#include "vm_sync.h"
 
 #include "builtin.h"
 
@@ -80,13 +81,20 @@ rb_hook_list_mark_and_update(rb_hook_list_t *hooks)
 static void clean_hooks(const rb_execution_context_t *ec, rb_hook_list_t *list);
 
 void
-rb_hook_list_free(rb_hook_list_t *hooks)
+rb_hook_list_free_hooks(rb_hook_list_t *hooks)
 {
-    hooks->need_clean = true;
+    VM_ASSERT(hooks);
+    RB_VM_LOCK_ENTER();
+    {
+        hooks->need_clean = true;
 
-    if (hooks->running == 0) {
-        clean_hooks(GET_EC(), hooks);
+        if (hooks->running == 0) {
+            clean_hooks(GET_EC(), hooks);
+        }
     }
+    RB_VM_LOCK_LEAVE();
+
+
 }
 
 /* ruby_vm_event_flags management */
@@ -214,8 +222,8 @@ rb_add_event_hook2(rb_event_hook_func_t func, rb_event_flag_t events, VALUE data
 static void
 clean_hooks(const rb_execution_context_t *ec, rb_hook_list_t *list)
 {
+    VM_ASSERT(list);
     rb_event_hook_t *hook, **nextp = &list->hooks;
-    rb_event_flag_t prev_events = list->events;
 
     VM_ASSERT(list->running == 0);
     VM_ASSERT(list->need_clean == true);
@@ -223,37 +231,70 @@ clean_hooks(const rb_execution_context_t *ec, rb_hook_list_t *list)
     list->events = 0;
     list->need_clean = false;
 
+    /*fprintf(stderr, "clean hooks (list: %p), (hooks: %p): local? %c\n",*/
+            /*list, list->hooks,*/
+            /*list->local ? 't' : 'f');*/
     while ((hook = *nextp) != 0) {
+        /*fprintf(stderr, "dereferncing hook\n");*/
         if (hook->hook_flags & RUBY_EVENT_HOOK_FLAG_DELETED) {
+            /*fprintf(stderr, "/dereferncing hook\n");*/
             *nextp = hook->next;
+            /*fprintf(stderr, "xfree hook\n");*/
             xfree(hook);
+            /*fprintf(stderr, "/xfree hook\n");*/
         }
         else {
+            /*fprintf(stderr, "list->events\n");*/
             list->events |= hook->events; /* update active events */
+            /*fprintf(stderr, "/list->events\n");*/
             nextp = &hook->next;
         }
     }
+
+    if (list->freeable) {
+        /*fprintf(stderr, "Freeing hooks in list: (list: %p), (hooks: %p)\n", list, list->hooks);*/
+        xfree(list->hooks);
+        list->hooks = NULL;
+        /*fprintf(stderr, "/Freeing hooks in list\n");*/
+    } else {
+        list->hooks = NULL;
+    }
+    /*fprintf(stderr, "called clean_hook for (list: %p), hooks: %p\n", list, list->hooks);*/
 }
 
 static void
 clean_hooks_check(const rb_execution_context_t *ec, rb_hook_list_t *list)
 {
-    if (UNLIKELY(list->need_clean)) {
-        if (list->running == 0) {
-            clean_hooks(ec, list);
+    RB_VM_LOCK_ENTER();
+    {
+        if (UNLIKELY(list->need_clean && list->hooks && !list->freed)) {
+            if (list->running == 0) {
+                /*fprintf(stderr, "Cleaning hooks: (list: %p), (hooks: %p), local? %c\n", list,*/
+                /*list->hooks, list->local ? 't' : 'f');*/
+                clean_hooks(ec, list);
+            }
         }
     }
+    RB_VM_LOCK_LEAVE();
+
 }
 
 #define MATCH_ANY_FILTER_TH ((rb_thread_t *)1)
 
-/* if func is 0, then clear all funcs */
+/* Returns number of entries removed. if func is 0, then clear all func entries */
 static int
 remove_event_hook(const rb_execution_context_t *ec, const rb_thread_t *filter_th, rb_event_hook_func_t func, VALUE data)
 {
     rb_hook_list_t *list = rb_ec_ractor_hooks(ec);
+    VM_ASSERT(list);
     int ret = 0;
     rb_event_hook_t *hook = list->hooks;
+    if (!hook) {
+        return ret;
+    }
+
+    RB_VM_LOCK_ENTER();
+    {
 
     while (hook) {
         if (func == 0 || hook->func == func) {
@@ -269,6 +310,8 @@ remove_event_hook(const rb_execution_context_t *ec, const rb_thread_t *filter_th
     }
 
     clean_hooks_check(ec, list);
+    }
+    RB_VM_LOCK_LEAVE();
     return ret;
 }
 
@@ -320,6 +363,9 @@ static void
 exec_hooks_body(const rb_execution_context_t *ec, rb_hook_list_t *list, const rb_trace_arg_t *trace_arg)
 {
     rb_event_hook_t *hook;
+    if (list->freed) return;
+
+    /*fprintf(stderr, "Executing hooks (list: %p), (hooks: %p): local ? %c\n", list, list->hooks, list->local ? 't' : 'f');*/
 
     for (hook = list->hooks; hook; hook = hook->next) {
         if (!(hook->hook_flags & RUBY_EVENT_HOOK_FLAG_DELETED) &&
@@ -1276,7 +1322,7 @@ disable_local_event_iseq_i(VALUE target, VALUE iseq_p, VALUE tpval)
         rb_hook_list_remove_tracepoint(hooks, tpval);
 
         if (hooks->events == 0) {
-            rb_hook_list_free(def->body.bmethod.hooks);
+            rb_hook_list_free_hooks(def->body.bmethod.hooks);
             def->body.bmethod.hooks = NULL;
         }
     }
@@ -1291,15 +1337,22 @@ rb_tracepoint_disable(VALUE tpval)
     tp = tpptr(tpval);
 
     if (tp->local_target_set) {
-        rb_hash_foreach(tp->local_target_set, disable_local_event_iseq_i, tpval);
-        tp->local_target_set = Qfalse;
-        ruby_vm_event_local_num--;
+        /*fprintf(stderr, "tracepoint_disable hash foreach\n");*/
+        RB_VM_LOCK_ENTER()
+        {
+            rb_hash_foreach(tp->local_target_set, disable_local_event_iseq_i, tpval);
+            tp->local_target_set = Qfalse;
+            ruby_vm_event_local_num--;
+        }
+        RB_VM_LOCK_LEAVE();
     }
     else {
         if (tp->target_th) {
+            /*fprintf(stderr, "remove_event_hook_with_data\n");*/
             rb_thread_remove_event_hook_with_data(tp->target_th->self, (rb_event_hook_func_t)tp_call_trace, tpval);
         }
         else {
+            /*fprintf(stderr, "remove_event_hook_with_data 2\n");*/
             rb_remove_event_hook_with_data((rb_event_hook_func_t)tp_call_trace, tpval);
         }
     }
