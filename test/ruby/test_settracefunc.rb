@@ -426,22 +426,26 @@ class TestSetTraceFunc < Test::Unit::TestCase
     end
   end
 
-  def test_enable_in_multiple_threads_concurrently
-    r1 = Ractor.new do
-      tp = TracePoint.new(:line) {} # local to ractor
-      30.times do
-        tp.enable
-        tp.disable
+  def test_enable_disable_in_multiple_ractors_with_target
+    rs = []
+    eval <<~CODE
+    100.times do |i|
+      Kernel.define_method :"my_method_to_change_for_tracing_\#{i}" do
+        true
       end
     end
-    r2 = Ractor.new do
-      tp = TracePoint.new(:line) {} # local to ractor
-      30.times do
-        tp.enable
-        tp.disable
+    100.times do |i|
+      rs << Ractor.new(i) do |j|
+        meth = :"my_method_to_change_for_tracing_\#{j}"
+        tp = TracePoint.new(:line) { } # local to ractor
+        100.times do
+          tp.enable(target: method(meth)) # change iseq internals of given method, should be done with lock
+          tp.disable
+        end
       end
     end
-    [r1, r2].each(&:take) # shouldn't raise
+    CODE
+    rs.each(&:take) # shouldn't raise
     assert true
   end
 
