@@ -927,7 +927,8 @@ static VALUE ractor_copy(VALUE obj); // in this file
 static void
 ractor_basket_setup(rb_execution_context_t *ec, struct rb_ractor_basket *basket, VALUE obj, VALUE move, bool exc, bool is_will, bool is_yield)
 {
-    basket->sender = rb_ec_ractor_ptr(ec)->pub.self;
+    rb_ractor_t *r = rb_ec_ractor_ptr(ec);
+    basket->sender = r->pub.self;
     basket->exception = exc;
 
     if (is_will) {
@@ -939,7 +940,9 @@ ractor_basket_setup(rb_execution_context_t *ec, struct rb_ractor_basket *basket,
         basket->v = obj;
     }
     else if (!RTEST(move)) {
+        r->threads.disable_thread_creation++;
         basket->v = ractor_copy(obj);
+        r->threads.disable_thread_creation--;
         basket->type = basket_type_copy;
     }
     else {

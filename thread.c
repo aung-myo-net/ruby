@@ -808,6 +808,13 @@ thread_create_core(VALUE thval, struct thread_create_params *params)
     rb_thread_t *th = rb_thread_ptr(thval), *current_th = rb_ec_thread_ptr(ec);
     int err;
 
+    rb_ractor_t *cur_ractor = GET_RACTOR();
+    if (cur_ractor->threads.disable_thread_creation > 0) {
+        cur_ractor->threads.disable_thread_creation--;
+        rb_raise(rb_eThreadError,
+                "can't start a new thread during Ractor.new or Ractor#send");
+    }
+
     if (OBJ_FROZEN(current_th->thgroup)) {
         rb_raise(rb_eThreadError,
                  "can't start a new thread (frozen ThreadGroup)");

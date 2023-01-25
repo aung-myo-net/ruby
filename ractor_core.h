@@ -121,6 +121,7 @@ struct rb_ractor_struct {
         struct rb_thread_sched sched;
         rb_execution_context_t *running_ec;
         rb_thread_t *main;
+        unsigned int disable_thread_creation;
     } threads;
     VALUE thgroup_default;
 
