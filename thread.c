@@ -4614,6 +4614,8 @@ rb_thread_atfork_internal(rb_thread_t *th, void (*atfork)(rb_thread_t *, const r
 
     // OK. Only this thread accesses:
     ccan_list_for_each(&vm->ractor.set, r, vmlr_node) {
+        rb_native_mutex_initialize(&r->sync.lock);
+        rb_native_cond_initialize(&r->sync.cond);
         ccan_list_for_each(&r->threads.set, i, lt_node) {
             atfork(i, th);
         }
