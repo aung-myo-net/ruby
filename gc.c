@@ -4703,7 +4703,7 @@ id2ref(VALUE objid)
     if (!UNDEF_P(orig = id2ref_obj_tbl(objspace, objid)) &&
         is_live_object(objspace, orig)) {
 
-        if (!rb_multi_ractor_p() || rb_ractor_shareable_p(orig)) {
+        if (!rb_multi_ractor_p() || GET_VM()->ractor.main_ractor == GET_RACTOR() || rb_ractor_shareable_p(orig)) {
             return orig;
         }
         else {
