@@ -144,16 +144,8 @@ module Test
       # Runs the tests reporting the status to +runner+
 
       def run runner
-        @options = runner.options
-
         trap "INFO" do
-          runner.report.each_with_index do |msg, i|
-            warn "\n%3d) %s" % [i + 1, msg]
-          end
-          warn ''
-          time = runner.start_time ? Time.now - runner.start_time : 0
-          warn "Current Test: %s#%s %.2fs" % [self.class, self.__name__, time]
-          runner.status $stderr
+          _on_info_signal_during_run(runner)
         end if runner.info_signal
 
         start_time = Time.now
@@ -161,22 +153,22 @@ module Test
         result = ""
 
         begin
-          @passed = nil
+          @_passed = nil
           self.before_setup
           self.setup
           self.after_setup
-          self.run_test self.__name__
-          result = "." unless io?
+          self._run_test @__name__
+          result = "." unless __io__?
           time = Time.now - start_time
-          runner.record self.class, self.__name__, self._assertions, time, nil
-          @passed = true
+          runner.record self.class, @__name__, @_assertions, time, nil
+          @_passed = true
         rescue *PASSTHROUGH_EXCEPTIONS
           raise
         rescue Exception => e
-          @passed = Test::Unit::PendedError === e
+          @_passed = Test::Unit::PendedError === e
           time = Time.now - start_time
-          runner.record self.class, self.__name__, self._assertions, time, e
-          result = runner.puke self.class, self.__name__, e
+          runner.record self.class, @__name__, @_assertions, time, e
+          result = runner.puke self.class, @__name__, e
         ensure
           %w{ before_teardown teardown after_teardown }.each do |hook|
             begin
@@ -184,9 +176,9 @@ module Test
             rescue *PASSTHROUGH_EXCEPTIONS
               raise
             rescue Exception => e
-              @passed = false
-              runner.record self.class, self.__name__, self._assertions, time, e
-              result = runner.puke self.class, self.__name__, e
+              @_passed = false
+              runner.record self.class, @__name__, @_assertions, time, e
+              result = runner.puke self.class, @__name__, e
             end
           end
           trap 'INFO', 'DEFAULT' if runner.info_signal
@@ -195,7 +187,7 @@ module Test
       end
 
       RUN_TEST_TRACE = "#{__FILE__}:#{__LINE__+3}:in `run_test'".freeze
-      def run_test(name)
+      def _run_test(name)
         progname, $0 = $0, "#{$0}: #{self.class}##{name}"
         self.__send__(name)
       ensure
@@ -203,21 +195,18 @@ module Test
         $0 = progname
       end
 
+      # NOTE: doesn't call super
       def initialize name # :nodoc:
         @__name__ = name
-        @__io__ = nil
-        @passed = nil
+        @__io__ = false
+        @_passed = nil
+        @_assertions = 0
         @@current = self # FIX: make thread local
       end
 
-      def self.current # :nodoc:
-        @@current # FIX: make thread local
-      end
-
-      ##
       # Return the output IO object
 
-      def io
+      def __io__
         @__io__ = true
         Test::Unit::Runner.output
       end
@@ -225,19 +214,23 @@ module Test
       ##
       # Have we hooked up the IO yet?
 
-      def io?
+      def __io__?
         @__io__
+      end
+
+      def self.current # :nodoc:
+        @@current # FIX: make thread local
       end
 
       def self.reset # :nodoc:
         @@test_suites = {}
         @@test_suites[self] = true
       end
-
       reset
 
       def self.inherited klass # :nodoc:
         @@test_suites[klass] = true
+        klass.instance_variable_set("@test_methods", {})
         super
       end
 
@@ -256,14 +249,14 @@ module Test
       end
 
       def self.test_methods # :nodoc:
-        public_instance_methods(true).grep(/^test/)
+        public_instance_methods(true).grep(/^test_/)
       end
 
       ##
       # Returns true if the test passed.
 
       def passed?
-        @passed
+        @_passed
       end
 
       ##
@@ -282,14 +275,25 @@ module Test
         false
       end
 
+
       def self.method_added(name)
         super
         return unless name.to_s.start_with?("test_")
-        @test_methods ||= {}
         if @test_methods[name]
           raise AssertionFailedError, "test/unit: method #{ self }##{ name } is redefined"
         end
         @test_methods[name] = true
+      end
+
+      private
+      def _on_info_signal_during_run(runner)
+        runner.report.each_with_index do |msg, i|
+          warn "\n%3d) %s" % [i + 1, msg]
+        end
+        warn ''
+        time = runner.start_time ? Time.now - runner.start_time : 0
+        warn "Current Test: %s#%s %.2fs" % [self.class, @__name__, time]
+        runner.status $stderr
       end
     end
   end

@@ -23,7 +23,9 @@ module Test
           ending ||= (ending_pattern = /(?<!\.)\z/; ".")
           ending_pattern ||= /(?<!#{Regexp.quote(ending)})\z/
           msg = msg.call if Proc === msg
-          ary = [msg, (default.call if default)].compact.reject(&:empty?)
+          ary = [msg, (default.call if default)]
+          ary.compact!
+          ary.reject!(&:empty?)
           ary.map! {|str| str.to_s.sub(ending_pattern, ending) }
           begin
             ary.join("\n")
@@ -63,7 +65,7 @@ module Test
         if block_given?
           raise "test_stdout ignored, use block only or without block" if test_stdout != []
           raise "test_stderr ignored, use block only or without block" if test_stderr != []
-          yield(stdout.lines.map {|l| l.chomp }, stderr.lines.map {|l| l.chomp }, status)
+          yield(stdout.lines.map! {|l| l.chomp!; l }, stderr.lines.map! {|l| l.chomp!; l }, status)
         else
           all_assertions(desc) do |a|
             [["stdout", test_stdout, stdout], ["stderr", test_stderr, stderr]].each do |key, exp, act|
@@ -71,7 +73,7 @@ module Test
                 if exp.is_a?(Regexp)
                   assert_match(exp, act)
                 elsif exp.all? {|e| String === e}
-                  assert_equal(exp, act.lines.map {|l| l.chomp })
+                  assert_equal(exp, act.lines.map! {|l| l.chomp!; l })
                 else
                   assert_pattern_list(exp, act)
                 end

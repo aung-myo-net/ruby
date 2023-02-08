@@ -181,6 +181,8 @@ module Test
       def initialize(*, &block)
         @init_hook = block
         @options = nil
+        @help = nil
+        @order = nil
         super(&nil)
       end
 
@@ -215,6 +217,10 @@ module Test
           "  " + (s =~ /[\s|&<>$()]/ ? s.inspect : s)
         }.join("\n")
 
+        if !options[:parallel]
+          puts "# Run options: #{@help}"
+        end
+
         @options = options
       end
 
@@ -233,7 +239,7 @@ module Test
 
         opts.on '-v', '--verbose', "Verbose. Show progress processing files." do
           options[:verbose] = true
-          self.verbose = options[:verbose]
+          @verbose = options[:verbose]
         end
 
         opts.on '-n', '--name PATTERN', "Filter test method names on pattern: /REGEXP/, !/REGEXP/ or STRING" do |a|
@@ -382,7 +388,9 @@ module Test
           @loadpath = []
           @hooks = {}
           @quit_called = false
+          @need_quit = false
           @response_at = nil
+          @start_time = nil
         end
 
         def name
@@ -673,6 +681,8 @@ module Test
         return false
       end
 
+      # Initializes the runner to run parallel, and runs all the tests
+      # with a number of workers
       def _run_parallel suites, type, result
         @records = {}
 
@@ -876,21 +886,24 @@ module Test
 
     module Statistics
       def update_list(list, rec, max)
-        if i = list.empty? ? 0 : list.bsearch_index {|*a| yield(*a)}
-          list[i, 0] = [rec]
-          list[max..-1] = [] if list.size >= max
+        begin
+          if i = list.empty? ? 0 : list.bsearch_index {|*a| yield(*a)}
+            list[i, 0] = [rec]
+            list[max..-1] = [] if list.size >= max
+          end
+        rescue # Can occur during interrupt
         end
       end
 
       def record(suite, method, assertions, time, error)
         if @options.values_at(:longest, :most_asserted).any?
-          @tops ||= {}
+          @tops ||= {longest: [], most_asserted: []}
           rec = [suite.name, method, assertions, time, error]
           if max = @options[:longest]
-            update_list(@tops[:longest] ||= [], rec, max) {|_,_,_,t,_|t<time}
+            update_list(@tops[:longest], rec, max) {|_,_,_,t,_|t<time}
           end
           if max = @options[:most_asserted]
-            update_list(@tops[:most_asserted] ||= [], rec, max) {|_,_,a,_,_|a<assertions}
+            update_list(@tops[:most_asserted], rec, max) {|_,_,a,_,_|a<assertions}
           end
         end
         # (((@record ||= {})[suite] ||= {})[method]) = [assertions, time, error]
@@ -898,17 +911,25 @@ module Test
       end
 
       def run(*args)
-        result = super
-        if @tops ||= nil
-          @tops.each do |t, list|
-            if list
-              puts "#{t.to_s.tr('_', ' ')} tests:"
-              list.each {|suite, method, assertions, time, error|
-                printf "%5.2fsec(%d): %s#%s\n", time, assertions, suite, method
-              }
+        show_stats = proc do
+          @tops ||= nil
+          if @tops
+            @tops.each do |t, list|
+              if list
+                puts "#{t.to_s.tr('_', ' ')} tests:"
+                list.each {|suite, method, assertions, time, error|
+                  printf "%5.2fsec(%d): %s#%s\n", time, assertions, suite, method
+                }
+              end
             end
           end
         end
+        trap(:INT) do
+          show_stats[]
+          raise Interrupt
+        end
+        result = super
+        show_stats[]
         result
       end
 
@@ -980,8 +1001,8 @@ module Test
       end
 
       def _prepare_run(suites, type)
-        options[:job_status] ||= :replace if @tty && !@verbose
-        case options[:color]
+        @options[:job_status] ||= :replace if @tty && !@verbose
+        case @options[:color]
         when :always
           color = true
         when :auto, nil
@@ -991,16 +1012,12 @@ module Test
         end
         @colorize = Colorize.new(color, colors_file: File.join(__dir__, "../../colors"))
         if color or @options[:job_status] == :replace
-          @verbose = !options[:parallel]
+          @verbose = !@options[:parallel]
         end
         @output = Output.new(self) unless @options[:testing]
-        filter = options[:filter]
+        filter = @options[:filter] || // # match anything
         type = "#{type}_methods"
-        total = if filter
-                  suites.inject(0) {|n, suite| n + suite.send(type).grep(filter).size}
-                else
-                  suites.inject(0) {|n, suite| n + suite.send(type).size}
-                end
+        total = suites.inject(0) {|n, suite| n + suite.send(type).grep(filter).size}
         @test_count = 0
         @total_tests = total.to_s(10)
       end
@@ -1264,25 +1281,39 @@ module Test
     end
 
     module RequireFiles # :nodoc: all
+      class Requirer
+        def initialize(files, runner)
+          @files = files
+          @runner = runner
+        end
+        def run
+          errors = {}
+          result = false
+          new_loadpath_dirs = {}
+          @files.each {|f|
+            d = File.dirname(path = File.realpath(f))
+            if !new_loadpath_dirs[d] && !$:.include?(d)
+              $: << d
+              new_loadpath_dirs[d] = true
+            end
+            begin
+              require path
+              result = true
+            rescue LoadError
+              next if errors[$!.message]
+              errors[$!.message] = true
+              @runner.puts "#{f}: #{$!}"
+            end
+          }
+          result # at least one file required
+        end
+      end
       def non_options(files, options)
         return false if !super
-        errors = {}
-        result = false
-        files.each {|f|
-          d = File.dirname(path = File.realpath(f))
-          unless $:.include? d
-            $: << d
-          end
-          begin
-            require path unless options[:parallel]
-            result = true
-          rescue LoadError
-            next if errors[$!.message]
-            errors[$!.message] = true
-            puts "#{f}: #{$!}"
-          end
-        }
-        result
+        if !options[:parallel]
+          options[:require_instance] = Requirer.new(files, self)
+        end
+        true
       end
     end
 
@@ -1391,7 +1422,7 @@ module Test
       attr_accessor :assertion_count                    # :nodoc:
       attr_writer   :test_count                         # :nodoc:
       attr_accessor :start_time                         # :nodoc:
-      attr_accessor :help                               # :nodoc:
+      attr_reader   :help                               # :nodoc:
       attr_accessor :verbose                            # :nodoc:
       attr_writer   :options                            # :nodoc:
 
@@ -1552,7 +1583,7 @@ module Test
         header = "#{type}_suite_header"
         puts send(header, suite) if respond_to? header
 
-        filter = options[:filter]
+        filter = @options[:filter]
 
         all_test_methods = suite.send "#{type}_methods"
         if filter
@@ -1562,7 +1593,7 @@ module Test
         end
         all_test_methods = @order.sort_by_name(all_test_methods)
 
-        leakchecker = LeakChecker.new
+        #leakchecker = LeakChecker.new
         if ENV["LEAK_CHECKER_TRACE_OBJECT_ALLOCATION"]
           require "objspace"
           trace = true
@@ -1590,7 +1621,7 @@ module Test
           $stdout.flush
 
           unless defined?(RubyVM::MJIT) && RubyVM::MJIT.enabled? # compiler process is wrongly considered as leak
-            leakchecker.check("#{inst.class}\##{inst.__name__}")
+            #leakchecker.check("#{inst.class}\##{inst.__name__}")
           end
 
           _end_method(inst)
@@ -1644,6 +1675,7 @@ module Test
       def initialize # :nodoc:
         @report = []
         @errors = @failures = @skips = 0
+        @test_count = @assertion_count = 0
         @verbose = false
         @mutex = Thread::Mutex.new
         @info_signal = Signal.list['INFO']
@@ -1671,9 +1703,9 @@ module Test
 
       def _run args = []
         args = process_args args # ARGH!! blame test/unit process_args
-        self.options.merge! args
+        @options.merge! args
 
-        puts "Run options: #{help}"
+        @options[:require_instance].run if @options[:require_instance]
 
         self.class.plugins.each do |plugin|
           send plugin
