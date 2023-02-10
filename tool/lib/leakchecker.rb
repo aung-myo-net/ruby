@@ -14,6 +14,7 @@ class LeakChecker
   end
 
   def check(test_name)
+    return if ENV['RUBY_TEST_NO_CHECKERS']
     if /i386-solaris/ =~ RUBY_PLATFORM && /TestGem/ =~ test_name
       GC.verify_internal_consistency
     end

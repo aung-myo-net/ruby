@@ -7,4 +7,6 @@ module ZombieHunter
   end
 end
 
-Test::Unit::TestCase.include ZombieHunter
+unless ENV['RUBY_TEST_NO_CHECKERS']
+  Test::Unit::TestCase.include ZombieHunter
+end

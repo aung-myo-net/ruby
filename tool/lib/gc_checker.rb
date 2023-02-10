@@ -32,5 +32,7 @@ module GCCompactChecker
   end
 end
 
-Test::Unit::TestCase.include GCDisabledChecker
-Test::Unit::TestCase.include GCCompactChecker if ENV['RUBY_TEST_GC_COMPACT']
+unless ENV['RUBY_TEST_NO_CHECKERS']
+  Test::Unit::TestCase.include GCDisabledChecker
+  Test::Unit::TestCase.include GCCompactChecker if ENV['RUBY_TEST_GC_COMPACT']
+end

@@ -139,6 +139,7 @@ module Test
 
       PASSTHROUGH_EXCEPTIONS = [NoMemoryError, SignalException,
                                 Interrupt, SystemExit] # :nodoc:
+      TEARDOWN_HOOKS = [:before_teardown, :teardown, :after_teardown]
 
       ##
       # Runs the tests reporting the status to +runner+
@@ -170,7 +171,7 @@ module Test
           runner.record self.class, @__name__, @_assertions, time, e
           result = runner.puke self.class, @__name__, e
         ensure
-          %w{ before_teardown teardown after_teardown }.each do |hook|
+          TEARDOWN_HOOKS.each do |hook|
             begin
               self.send hook
             rescue *PASSTHROUGH_EXCEPTIONS
@@ -274,7 +275,6 @@ module Test
       def on_parallel_worker?
         false
       end
-
 
       def self.method_added(name)
         super

@@ -10,6 +10,7 @@ require_relative '../../gc_checker'
 
 module Test
   module Unit
+    # Worker sub-process
     class Worker < Runner # :nodoc:
       class << self
         undef autorun
@@ -26,11 +27,12 @@ module Test
       end
 
       def _run_suites(suites, type) # :nodoc:
-        suites.map do |suite|
+        suites.each do |suite|
           _run_suite(suite, type)
         end
       end
 
+      # TODO: only send this when in verbose mode
       def _start_method(inst)
         _report "start", Marshal.dump([inst.class.name, inst.__name__])
       end
@@ -46,13 +48,17 @@ module Test
         th = Thread.new do
           begin
             while buf = (self.verbose ? i.gets : i.readpartial(1024))
-              _report "p", buf or break
+              if @verbose
+                _report "p", buf or break
+              end
             end
           rescue IOError
           end
         end
 
-        e, f, s = @errors, @failures, @skips
+        @errors = 0
+        @failures = 0
+        @skips = 0
 
         begin
           result = orig_run_suite(suite, type)
@@ -75,7 +81,7 @@ module Test
 
         result << @partial_report
         @partial_report = nil
-        result << [@errors-e,@failures-f,@skips-s]
+        result << [@errors,@failures,@skips]
         result << ($: - @old_loadpath)
         result << suite.name
 
@@ -89,6 +95,7 @@ module Test
         i.close if i && !i.closed?
       end
 
+      # entire worker run, runs multiple suites (files)
       def run(args = []) # :nodoc:
         process_args args
         @@stop_auto_run = true
@@ -125,7 +132,8 @@ module Test
                 _report "ready"
                 next
               end
-              _run_suites Test::Unit::TestCase.test_suites-suites, $2.to_sym
+              # run the loaded suite (class) in the file
+              _run_suites Test::Unit::TestCase.test_suites - suites, $2.to_sym
 
               if @need_exit
                 _report "bye"
@@ -173,6 +181,7 @@ module Test
       end
 
       def record(suite, method, assertions, time, error) # :nodoc:
+        return unless need_records?
         case error
         when nil
         when Test::Unit::AssertionFailedError, Test::Unit::PendedError

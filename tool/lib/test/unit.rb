@@ -98,7 +98,7 @@ module Test
       end
 
       class Alpha < NoSort
-        include MJITFirst
+        #include MJITFirst
 
         def sort_by_name(list)
           list.sort_by(&:name)
@@ -112,7 +112,7 @@ module Test
 
       # shuffle test suites based on CRC32 of their names
       Shuffle = Struct.new(:seed, :salt) do
-        include MJITFirst
+        #include MJITFirst
 
         def initialize(seed)
           self.class::CRC_TBL ||= (0..255).map {|i|
@@ -129,6 +129,10 @@ module Test
 
         def sort_by_string(list)
           list.sort_by {|e| randomize_key(e)}
+        end
+
+        def group(list)
+          list
         end
 
         private
@@ -164,39 +168,40 @@ module Test
         @@run_count.nonzero?
       end
 
-      def run(*)
-        @@run_count += 1
-        super
-      end
-
       def run_once
         return if have_run?
         return if $! # don't run if there was an exception
         yield
       end
+
+      def run(*)
+        @@run_count += 1
+        super
+      end
+
       module_function :run_once
     end
 
     module Options # :nodoc: all
+      attr_reader :option_parser, :verbose
+
       def initialize(*, &block)
         @init_hook = block
         @options = nil
+        @run_options = nil
         @help = nil
         @order = nil
+        @verbose = false
+        @option_parser = OptionParser.new
         super(&nil)
-      end
-
-      def option_parser
-        @option_parser ||= OptionParser.new
       end
 
       def process_args(args = [])
         return @options if @options
         orig_args = args.dup
         options = {}
-        opts = option_parser
-        setup_options(opts, options)
-        opts.parse!(args)
+        setup_options(@option_parser, options)
+        @option_parser.parse!(args)
         orig_args -= args
         args = @init_hook.call(args, options) if @init_hook
         non_options(args, options)
@@ -217,11 +222,7 @@ module Test
           "  " + (s =~ /[\s|&<>$()]/ ? s.inspect : s)
         }.join("\n")
 
-        if !options[:parallel]
-          puts "# Run options: #{@help}"
-        end
-
-        @options = options
+        @options = options # first time @options is set
       end
 
       private
@@ -279,17 +280,25 @@ module Test
     end
 
     module Parallel # :nodoc: all
+      # More ivars for parallel test state are set in _run_parallel
+      def initialize(*, &blk)
+        @jobserver = nil
+        @worker_timeout = nil
+        @interrupt = nil
+        @files = nil
+        super
+      end
+
       def process_args(args = [])
         return @options if @options
         options = super
-        if @options[:parallel]
+        if options[:parallel]
           @files = args
         end
         options
       end
 
       def non_options(files, options)
-        @jobserver = nil
         makeflags = ENV.delete("MAKEFLAGS")
         if !options[:parallel] and
           /(?:\A|\s)--jobserver-(?:auth|fds)=(?:(\d+),(\d+)|fifo:((?:\\.|\S)+))/ =~ makeflags
@@ -361,6 +370,10 @@ module Test
         end
       end
 
+      def need_records?
+        @options[:timetable_data] || super
+      end
+
       class Worker
         def self.launch(ruby,args=[])
           scale = EnvUtil.timeout_scale
@@ -371,10 +384,8 @@ module Test
           new(io, io.pid, :waiting)
         end
 
-        attr_reader :quit_called
-        attr_accessor :start_time
-        attr_accessor :response_at
-        attr_accessor :current
+        attr_reader :io, :pid, :real_file, :quit_called, :response_at
+        attr_accessor :start_time, :current, :status
 
         @@worker_number = 0
 
@@ -391,6 +402,7 @@ module Test
           @need_quit = false
           @response_at = nil
           @start_time = nil
+          @current = nil
         end
 
         def name
@@ -401,6 +413,7 @@ module Test
           @io.puts(*args)
         end
 
+        # Communicates with worker process to run a test file
         def run(task,type)
           @file = File.basename(task, ".rb")
           @real_file = task
@@ -469,9 +482,6 @@ module Test
           end
         end
 
-        attr_reader :io, :pid
-        attr_accessor :status, :file, :real_file, :loadpath
-
         private
 
         def call_hook(id,*additional)
@@ -479,8 +489,7 @@ module Test
           @hooks[id].each{|hook| hook[self,additional] }
           self
         end
-
-      end
+      end # Worker
 
       def flush_job_tokens
         if @jobserver
@@ -604,6 +613,7 @@ module Test
         (@fake_classes ||= {})[name] ||= FakeClass.new(name)
       end
 
+      # Deal with worker events
       def deal(io, type, result, rep, shutting_down = false)
         worker = @workers_hash[io]
         cmd = worker.read
@@ -612,9 +622,9 @@ module Test
         case cmd
         when ''
           # just only dots, ignore
-        when /^okay$/
+        when /^okay$/ # about to run suite
           worker.status = :running
-        when /^ready(!)?$/
+        when /^ready(!)?$/ # ready to run suite
           bang = $1
           worker.status = :ready
 
@@ -630,9 +640,9 @@ module Test
           @test_count += 1
 
           jobs_status(worker)
-        when /^start (.+?)$/
+        when /^start (.+?)$/ # start of method
           worker.current = Marshal.load($1.unpack1("m"))
-        when /^done (.+?)$/
+        when /^done (.+?)$/ # done running suite
           begin
             r = Marshal.load($1.unpack1("m"))
           rescue
@@ -645,7 +655,8 @@ module Test
           jobs_status(worker) if @options[:job_status] == :replace
 
           return true
-        when /^record (.+?)$/
+        when /^record (.+?)$/ # recorded hook
+          raise "records shouldn't be on" unless need_records?
           begin
             r = Marshal.load($1.unpack1("m"))
 
@@ -661,13 +672,14 @@ module Test
             return true
           end
           record(fake_class(r[0]), *r[1..-1])
-        when /^p (.+?)$/
-          del_jobs_status
-          print $1.unpack1("m")
-          jobs_status(worker) if @options[:job_status] == :replace
-        when /^after (.+?)$/
+        when /^p (.+?)$/ # update job status
+          if @options[:verbose]
+            print $1.unpack1("m")
+            jobs_status(worker) if @options[:job_status] == :replace
+          end
+        when /^after (.+?)$/ # couldn't load file
           @warnings << Marshal.load($1.unpack1("m"))
-        when /^bye (.+?)$/
+        when /^bye (.+?)$/ # exception in worker
           after_worker_down worker, Marshal.load($1.unpack1("m"))
         when /^bye$/, nil
           if shutting_down || worker.quit_called
@@ -788,12 +800,12 @@ module Test
                 end
               end.compact
               verbose = @verbose
-              job_status = options[:job_status]
-              options[:verbose] = @verbose = true
-              options[:job_status] = :normal
+              job_status = @options[:job_status]
+              @options[:verbose] = @verbose = true
+              @options[:job_status] = :normal
               result.concat _run_suites(error, type)
-              options[:verbose] = @verbose = verbose
-              options[:job_status] = job_status
+              @options[:verbose] = @verbose = verbose
+              @options[:job_status] = job_status
             end
             @options[:parallel] = parallel
           end
@@ -832,7 +844,6 @@ module Test
 
       def _run_suites suites, type
         _prepare_run(suites, type)
-        @interrupt = nil
         result = []
         GC.start
         if @options[:parallel]
@@ -876,8 +887,8 @@ module Test
 
       def _run_suites(suites, type)
         result = super
-        report.reject!{|r| r.start_with? "Skipped:" } if @options[:hide_skip]
-        report.sort_by!{|r| r.start_with?("Skipped:") ? 0 : \
+        @report.reject!{|r| r.start_with? "Skipped:" } if @options[:hide_skip]
+        @report.sort_by!{|r| r.start_with?("Skipped:") ? 0 : \
                            (r.start_with?("Failure:") ? 1 : 2) }
         failed(nil)
         result
@@ -885,36 +896,49 @@ module Test
     end
 
     module Statistics
+      def initialize(*, &blk)
+        @stats = nil
+        super
+      end
+
       def update_list(list, rec, max)
-        begin
-          if i = list.empty? ? 0 : list.bsearch_index {|*a| yield(*a)}
-            list[i, 0] = [rec]
-            list[max..-1] = [] if list.size >= max
-          end
-        rescue # Can occur during interrupt
+        if i = list.empty? ? 0 : list.bsearch_index {|*a| yield(*a)}
+          list[i, 0] = [rec]
+          list[max..-1] = [] if list.size >= max
         end
       end
 
       def record(suite, method, assertions, time, error)
-        if @options.values_at(:longest, :most_asserted).any?
-          @tops ||= {longest: [], most_asserted: []}
+        if stats
           rec = [suite.name, method, assertions, time, error]
           if max = @options[:longest]
-            update_list(@tops[:longest], rec, max) {|_,_,_,t,_|t<time}
+            update_list(stats[:longest], rec, max) {|_,_,_,t,_|t<time}
           end
           if max = @options[:most_asserted]
-            update_list(@tops[:most_asserted], rec, max) {|_,_,a,_,_|a<assertions}
+            update_list(stats[:most_asserted], rec, max) {|_,_,a,_,_|a<assertions}
           end
         end
         # (((@record ||= {})[suite] ||= {})[method]) = [assertions, time, error]
         super
       end
 
+      def stats
+        @stats ||= begin
+          if @options[:longest]
+            stats = {longest: []}
+          end
+          if @options[:most_asserted]
+            stats ||= {}
+            stats[:most_asserted] = []
+          end
+          stats
+        end
+      end
+
       def run(*args)
-        show_stats = proc do
-          @tops ||= nil
-          if @tops
-            @tops.each do |t, list|
+        if stats
+          show_stats = proc do
+            stats.each do |t, list|
               if list
                 puts "#{t.to_s.tr('_', ' ')} tests:"
                 list.each {|suite, method, assertions, time, error|
@@ -923,13 +947,13 @@ module Test
               end
             end
           end
-        end
-        trap(:INT) do
-          show_stats[]
-          raise Interrupt
+          trap(:INT) do
+            show_stats[]
+            abort "Interrupted"
+          end
         end
         result = super
-        show_stats[]
+        show_stats[] if show_stats
         result
       end
 
@@ -944,11 +968,24 @@ module Test
           options[:most_asserted] = n
         end
       end
+
+      def need_records?
+        @options[:longest] || @options[:most_asserted] || super
+      end
     end
 
     module StatusLine # :nodoc: all
+      def initialize(*, &blk)
+        @terminal_width = nil
+        @status_line_size = 0
+        @output = nil
+        @colorize = nil
+        @report_count = 0
+        @tty = $stdout.tty?
+        super
+      end
       def terminal_width
-        unless @terminal_width ||= nil
+        unless @terminal_width
           begin
             require 'io/console'
             width = $stdout.winsize[1]
@@ -962,7 +999,6 @@ module Test
       end
 
       def del_status_line(flush = true)
-        @status_line_size ||= 0
         if @options[:job_status] == :replace
           $stdout.print "\r"+" "*@status_line_size+"\r"
         else
@@ -973,7 +1009,6 @@ module Test
       end
 
       def add_status(line)
-        @status_line_size ||= 0
         if @options[:job_status] == :replace
           line = line[0...(terminal_width-@status_line_size)]
         end
@@ -997,7 +1032,7 @@ module Test
       end
 
       def output
-        (@output ||= nil) || super
+        @output || super
       end
 
       def _prepare_run(suites, type)
@@ -1036,14 +1071,12 @@ module Test
         $stdout.flush
       end
 
-      def _print(s); $stdout.print(s); end
       def succeed; del_status_line; end
 
       def failed(s)
         return if s and @options[:job_status] != :replace
         sep = "\n"
-        @report_count ||= 0
-        report.each do |msg|
+        @report.each do |msg|
           if msg.start_with? "Skipped:"
             if @options[:hide_skip]
               del_status_line
@@ -1058,12 +1091,7 @@ module Test
           @failed_output.print(sep, @colorize.decorate(first, color), msg, "\n")
           sep = nil
         end
-        report.clear
-      end
-
-      def initialize
-        super
-        @tty = $stdout.tty?
+        @report.clear
       end
 
       def run(*args)
@@ -1286,15 +1314,13 @@ module Test
           @files = files
           @runner = runner
         end
-        def run
+        def call
           errors = {}
           result = false
-          new_loadpath_dirs = {}
           @files.each {|f|
             d = File.dirname(path = File.realpath(f))
-            if !new_loadpath_dirs[d] && !$:.include?(d)
+            unless $:.include?(d)
               $: << d
-              new_loadpath_dirs[d] = true
             end
             begin
               require path
@@ -1310,8 +1336,8 @@ module Test
       end
       def non_options(files, options)
         return false if !super
-        if !options[:parallel]
-          options[:require_instance] = Requirer.new(files, self)
+        unless options[:parallel]
+          options[:requirer] = Requirer.new(files, self)
         end
         true
       end
@@ -1333,6 +1359,7 @@ module Test
       end
     end
 
+    # FIXME: this is a weird way to exclude test methods
     module ExcludesOption # :nodoc: all
       class ExcludedMethods < Struct.new(:excludes)
         def exclude(name, reason)
@@ -1417,14 +1444,7 @@ module Test
     end
 
     class Runner # :nodoc: all
-
-      attr_accessor :report, :failures, :errors, :skips # :nodoc:
-      attr_accessor :assertion_count                    # :nodoc:
-      attr_writer   :test_count                         # :nodoc:
-      attr_accessor :start_time                         # :nodoc:
-      attr_reader   :help                               # :nodoc:
-      attr_accessor :verbose                            # :nodoc:
-      attr_writer   :options                            # :nodoc:
+      attr_reader :report, :failures, :errors, :skips, :start_time # :nodoc:
 
       ##
       # :attr:
@@ -1435,7 +1455,7 @@ module Test
       # This is auto-detected by default but may be overridden by custom
       # runners.
 
-      attr_accessor :info_signal
+      attr_reader :info_signal
 
       ##
       # Lazy accessor for options.
@@ -1515,10 +1535,6 @@ module Test
         output.print(*a)
       end
 
-      def test_count # :nodoc:
-        @test_count ||= 0
-      end
-
       ##
       # Runner for a given +type+ (eg, test vs bench).
 
@@ -1561,11 +1577,11 @@ module Test
               [(@repeat_count ? "(#{@@current_repeat_count}/#{@repeat_count}) " : ""), type,
                 t, @test_count.fdiv(t), @assertion_count.fdiv(t)]
         end while @repeat_count && @@current_repeat_count < @repeat_count &&
-                  report.empty? && failures.zero? && errors.zero?
+                  @report.empty? && @failures.zero? && @errors.zero?
 
         output.sync = old_sync if sync
 
-        report.each_with_index do |msg, i|
+        @report.each_with_index do |msg, i|
           puts "\n%3d) %s" % [i + 1, msg]
         end
 
@@ -1593,17 +1609,15 @@ module Test
         end
         all_test_methods = @order.sort_by_name(all_test_methods)
 
-        #leakchecker = LeakChecker.new
+        leakchecker = LeakChecker.new
         if ENV["LEAK_CHECKER_TRACE_OBJECT_ALLOCATION"]
           require "objspace"
           trace = true
         end
 
         assertions = all_test_methods.map { |method|
-
-          inst = suite.new method
+          inst = suite.new(method)
           _start_method(inst)
-          inst._assertions = 0
 
           print "#{suite}##{method} = " if @verbose
 
@@ -1621,7 +1635,7 @@ module Test
           $stdout.flush
 
           unless defined?(RubyVM::MJIT) && RubyVM::MJIT.enabled? # compiler process is wrongly considered as leak
-            #leakchecker.check("#{inst.class}\##{inst.__name__}")
+            leakchecker.check("#{inst.class}\##{inst.__name__}")
           end
 
           _end_method(inst)
@@ -1656,6 +1670,10 @@ module Test
       def record suite, method, assertions, time, error
       end
 
+      def need_records?
+        false
+      end
+
       def location e # :nodoc:
         last_before_assertion = ""
 
@@ -1668,15 +1686,11 @@ module Test
         last_before_assertion.sub(/:in .*$/, '')
       end
 
-      ##
-      # Writes status for failed test +meth+ in +klass+ which finished with
-      # exception +e+
-
+      # Modules are prepended to this class so this is the last in the chain
       def initialize # :nodoc:
         @report = []
         @errors = @failures = @skips = 0
         @test_count = @assertion_count = 0
-        @verbose = false
         @mutex = Thread::Mutex.new
         @info_signal = Signal.list['INFO']
         @repeat_count = nil
@@ -1705,14 +1719,18 @@ module Test
         args = process_args args # ARGH!! blame test/unit process_args
         @options.merge! args
 
-        @options[:require_instance].run if @options[:require_instance]
+        puts "Run options: #{@help}"
+        if req = @options.delete(:requirer)
+          print "\n# Loading test files"
+          req.call
+        end
 
         self.class.plugins.each do |plugin|
           send plugin
-          break unless report.empty?
+          break unless @report.empty?
         end
 
-        return failures + errors if self.test_count > 0 # or return nil...
+        return @failures + @errors if @test_count > 0 # or return nil...
       rescue Interrupt
         abort 'Interrupted'
       end
@@ -1729,7 +1747,7 @@ module Test
 
       def status io = self.output
         format = "%d tests, %d assertions, %d failures, %d errors, %d skips"
-        io.puts format % [test_count, assertion_count, failures, errors, skips]
+        io.puts format % [@test_count, @assertion_count, @failures, @errors, @skips]
       end
 
       prepend Test::Unit::Options
@@ -1771,7 +1789,7 @@ module Test
 
       # Overriding of Test::Unit::Runner#puke
       def puke klass, meth, e
-        n = report.size
+        n = @report.size
         e = case e
             when Test::Unit::PendedError then
               @skips += 1
@@ -1791,7 +1809,7 @@ module Test
         @report << e
         rep = e[0, 1]
         if Test::Unit::PendedError === e and /no message given\z/ =~ e.message
-          report.slice!(n..-1)
+          @report.slice!(n..-1)
           rep = "."
         end
         rep
@@ -1803,7 +1821,7 @@ module Test
         include Test::Unit::RequireFiles
       end
 
-      attr_accessor :to_run, :options
+      attr_reader :options
 
       def initialize(force_standalone = false, default_dir = nil, argv = ARGV)
         @force_standalone = force_standalone
@@ -1841,12 +1859,12 @@ module Test
     end
 
     class ProxyError < StandardError # :nodoc: all
+      attr_reader :message, :backtrace
+
       def initialize(ex)
         @message = ex.message
         @backtrace = ex.backtrace
       end
-
-      attr_accessor :message, :backtrace
     end
   end
 end
