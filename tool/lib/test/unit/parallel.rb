@@ -104,6 +104,7 @@ module Test
         @@stop_auto_run = true
         @opts = @options.dup
         @need_exit = false
+        $LOAD_PATH.unshift(DEFAULT_TEST_DIR) unless $:.include?(DEFAULT_TEST_DIR)
 
         @old_loadpath = []
         begin

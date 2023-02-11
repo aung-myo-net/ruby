@@ -63,6 +63,7 @@ module Test
   ##
   # Test::Unit is an implementation of the xUnit testing framework for Ruby.
   module Unit
+    DEFAULT_TEST_DIR = File.expand_path(__dir__ + "../../../../test")
     ##
     # Assertion base class
 
@@ -225,9 +226,9 @@ module Test
         }.join("\n")
 
         if @orig_files.any?
-          custom_basedir = options[:base_directory]
-          custom_basedir = nil if custom_basedir == @default_dir
-          unless custom_basedir && @orig_files == [@default_dir]
+          custom_basedirs = options[:base_directories]
+          custom_basedirs = nil if custom_basedirs == [@default_dir]
+          unless custom_basedirs && @orig_files == [@default_dir]
             @help << "\n  #{@orig_files.inspect}\n"
           end
         end
@@ -1193,7 +1194,6 @@ module Test
     end
 
     module GlobOption # :nodoc: all
-      DEFAULT_TEST_DIR = File.expand_path(__dir__ + "../../../../test")
       @@testfile_prefix = "test"
       @@testfile_suffix = "test"
 
@@ -1208,7 +1208,7 @@ module Test
         parser.on '-B', '--base-directory DIR', 'Base directory to glob.' do |dir|
           raise OptionParser::InvalidArgument, "not a directory: #{dir}" unless File.directory?(dir)
           dir = File.expand_path(dir) unless File.absolute_path?(dir)
-          options[:base_directory] = dir
+          (options[:base_directories] ||= []) << dir
         end
         # example: -x /test_hash/
         parser.on '-x', '--exclude REGEXP', 'Exclude test files on pattern.' do |pattern|
@@ -1234,15 +1234,15 @@ module Test
         if worker_process?
           return super(files, options)
         end
-        paths = [options[:base_directory], nil].uniq
+        paths = [options[:base_directories], nil].flatten.uniq
         if exclude_pats = options[:exclude_file_patterns]
           exclude_re = Regexp.union(exclude_pats.map {|r| %r"#{r}"})
         end
-        custom_basedir = options[:base_directory] if options[:base_directory] != DEFAULT_TEST_DIR
-        if custom_basedir && files == DEFAULT_TEST_DIR
-          files.replace([custom_basedir.dup])
-        elsif custom_basedir && files != DEFAULT_TEST_DIR
-          files << custom_basedir.dup
+        custom_basedirs = options[:base_directories] if options[:base_directories] != [DEFAULT_TEST_DIR]
+        if custom_basedirs && files == [DEFAULT_TEST_DIR]
+          files.replace custom_basedirs.dup
+        elsif custom_basedirs && files != [DEFAULT_TEST_DIR]
+          files.concat custom_basedirs
           files.uniq!
         end
         #STDERR.print "files: ", files, "\n"
@@ -1407,8 +1407,9 @@ module Test
               result = true
             rescue LoadError
               next if errors[$!.message]
+              @runner.puts if errors.empty?
               errors[$!.message] = true
-              @runner.puts "#{f}: #{$!}"
+              @runner.puts "#{f}: #{$!}. Skipping it."
             end
           }
           result # at least one file required
@@ -1897,12 +1898,17 @@ module Test
         @force_standalone = force_standalone
         @to_run = nil
         @runner = Runner.new do |runner, files, options|
-          base = options[:base_directory] ||= default_dir
-          base = File.expand_path(base) unless File.absolute_path?(base)
+          bases = options[:base_directories] ||= [default_dir]
+          bases = bases.map do |base|
+            File.absolute_path?(base) ? base : File.expand_path(base)
+          end
           files << default_dir if files.empty? and default_dir
           @to_run = files
           yield self if block_given?
-          $LOAD_PATH.unshift base if base
+          bases.each do |base|
+            $LOAD_PATH.unshift base if base
+          end
+          $LOAD_PATH.unshift DEFAULT_TEST_DIR unless $:.include?(DEFAULT_TEST_DIR)
           runner.default_dir = default_dir
           files
         end

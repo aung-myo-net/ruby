@@ -141,9 +141,7 @@ module Test
                                 Interrupt, SystemExit] # :nodoc:
       TEARDOWN_HOOKS = [:before_teardown, :teardown, :after_teardown]
 
-      ##
-      # Runs the tests reporting the status to +runner+
-
+      # Run a single test method
       def run runner
         trap "INFO" do
           _on_info_signal_during_run(runner)
