@@ -20,6 +20,10 @@ module Test
       undef _run_suites
       undef run
 
+      def worker_process?
+        true
+      end
+
       def increment_io(orig) # :nodoc:
         *rest, io = 32.times.inject([orig.dup]){|ios, | ios << ios.last.dup }
         rest.each(&:close)
@@ -32,7 +36,6 @@ module Test
         end
       end
 
-      # TODO: only send this when in verbose mode
       def _start_method(inst)
         _report "start", Marshal.dump([inst.class.name, inst.__name__])
       end

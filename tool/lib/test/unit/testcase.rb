@@ -196,7 +196,6 @@ module Test
         $0 = progname
       end
 
-      # NOTE: doesn't call super
       def initialize name # :nodoc:
         @__name__ = name
         @__io__ = false

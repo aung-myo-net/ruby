@@ -184,6 +184,7 @@ module Test
 
     module Options # :nodoc: all
       attr_reader :option_parser, :verbose
+      attr_writer :default_dir
 
       def initialize(*, &block)
         @init_hook = block
@@ -192,6 +193,7 @@ module Test
         @help = nil
         @order = nil
         @verbose = false
+        @default_dir = nil
         @option_parser = OptionParser.new
         super(&nil)
       end
@@ -203,7 +205,7 @@ module Test
         setup_options(@option_parser, options)
         @option_parser.parse!(args)
         orig_args -= args
-        args = @init_hook.call(args, options) if @init_hook
+        args = @init_hook.call(self, args, options) if @init_hook
         non_options(args, options)
         @run_options = orig_args
 
@@ -221,6 +223,14 @@ module Test
         @help = "\n" + orig_args.map { |s|
           "  " + (s =~ /[\s|&<>$()]/ ? s.inspect : s)
         }.join("\n")
+
+        if @orig_files.any?
+          custom_basedir = options[:base_directory]
+          custom_basedir = nil if custom_basedir == @default_dir
+          unless custom_basedir && @orig_files == [@default_dir]
+            @help << "\n  #{@orig_files.inspect}\n"
+          end
+        end
 
         @options = options # first time @options is set
       end
@@ -244,7 +254,7 @@ module Test
         end
 
         opts.on '-n', '--name PATTERN', "Filter test method names on pattern: /REGEXP/, !/REGEXP/ or STRING" do |a|
-          (options[:filter] ||= []) << a
+          (options[:test_name_filter] ||= []) << a
         end
 
         orders = Test::Unit::Order::Types.keys
@@ -253,8 +263,9 @@ module Test
         end
       end
 
+      # Change options[:test_name_filter] from Array of strings/regexps to single regexp
       def non_options(files, options)
-        filter = options[:filter]
+        filter = options[:test_name_filter]
         if filter
           pos_pat = /\A\/(.*)\/\z/
           neg_pat = /\A!\/(.*)\/\z/
@@ -273,7 +284,7 @@ module Test
             negative = Regexp.union(*negative.map! {|s| Regexp.new(s[neg_pat, 1])})
             filter = /\A(?=.*#{filter})(?!.*#{negative})/
           end
-          options[:filter] = filter
+          options[:test_name_filter] = filter
         end
         true
       end
@@ -299,6 +310,7 @@ module Test
       end
 
       def non_options(files, options)
+        return super(files, options) if worker_process?
         makeflags = ENV.delete("MAKEFLAGS")
         if !options[:parallel] and
           /(?:\A|\s)--jobserver-(?:auth|fds)=(?:(\d+),(\d+)|fifo:((?:\\.|\S)+))/ =~ makeflags
@@ -325,6 +337,7 @@ module Test
         super
       end
 
+
       def status(*args)
         result = super
         raise @interrupt if @interrupt
@@ -332,6 +345,10 @@ module Test
       end
 
       private
+      def worker_process?
+        false
+      end
+
       def setup_options(opts, options)
         super
 
@@ -640,7 +657,7 @@ module Test
           @test_count += 1
 
           jobs_status(worker)
-        when /^start (.+?)$/ # start of method
+        when /^start (.+?)$/ # start of method, set current test case of worker
           worker.current = Marshal.load($1.unpack1("m"))
         when /^done (.+?)$/ # done running suite
           begin
@@ -696,6 +713,7 @@ module Test
       # Initializes the runner to run parallel, and runs all the tests
       # with a number of workers
       def _run_parallel suites, type, result
+        raise if worker_process?
         @records = {}
 
         if @options[:parallel] < 1
@@ -725,7 +743,7 @@ module Test
 
             if !(_io = IO.select(@ios, nil, nil, timeout))
               timeout = Time.now - @worker_timeout
-              quit_workers {|w| w.response_at&.<(timeout) }&.map {|w|
+              quit_workers {|w| w.response_at&.<(timeout) }&.each {|w|
                 rep << {file: w.real_file, result: nil, testcase: w.current[0], error: w.current}
               }
             elsif _io.first.any? {|io|
@@ -768,7 +786,9 @@ module Test
           quit_workers
           flush_job_tokens
 
-          unless @interrupt || !@options[:retry] || @need_quit
+          # Retry suites that failed in-process
+          if !@interrupt && !@need_quit && @options[:retry]
+            del_status_line or puts
             parallel = @options[:parallel]
             @options[:parallel] = false
             suites, rep = rep.partition {|r|
@@ -776,7 +796,6 @@ module Test
                 (!r.key?(:report) || r[:report].any? {|e| !e[2].is_a?(Test::Unit::PendedError)})
             }
             suites.map {|r| File.realpath(r[:file])}.uniq.each {|file| require file}
-            del_status_line or puts
             error, suites = suites.partition {|r| r[:error]}
             unless suites.empty?
               puts "\n""Retrying..."
@@ -974,6 +993,7 @@ module Test
       end
     end
 
+    # If in parallel mode, this is just for the main process
     module StatusLine # :nodoc: all
       def initialize(*, &blk)
         @terminal_width = nil
@@ -1036,6 +1056,7 @@ module Test
       end
 
       def _prepare_run(suites, type)
+        raise if worker_process?
         @options[:job_status] ||= :replace if @tty && !@verbose
         case @options[:color]
         when :always
@@ -1050,7 +1071,7 @@ module Test
           @verbose = !@options[:parallel]
         end
         @output = Output.new(self) unless @options[:testing]
-        filter = @options[:filter] || // # match anything
+        filter = @options[:test_name_filter] || // # match anything
         type = "#{type}_methods"
         total = suites.inject(0) {|n, suite| n + suite.send(type).grep(filter).size}
         @test_count = 0
@@ -1172,18 +1193,26 @@ module Test
     end
 
     module GlobOption # :nodoc: all
+      DEFAULT_TEST_DIR = File.expand_path(__dir__ + "../../../../test")
       @@testfile_prefix = "test"
       @@testfile_suffix = "test"
+
+      def initialize(*, &blk)
+        @orig_files = nil
+        super
+      end
 
       def setup_options(parser, options)
         super
         parser.separator "globbing options:"
         parser.on '-B', '--base-directory DIR', 'Base directory to glob.' do |dir|
           raise OptionParser::InvalidArgument, "not a directory: #{dir}" unless File.directory?(dir)
+          dir = File.expand_path(dir) unless File.absolute_path?(dir)
           options[:base_directory] = dir
         end
+        # example: -x /test_hash/
         parser.on '-x', '--exclude REGEXP', 'Exclude test files on pattern.' do |pattern|
-          (options[:reject] ||= []) << pattern
+          (options[:exclude_file_patterns] ||= []) << pattern
         end
       end
 
@@ -1199,39 +1228,88 @@ module Test
         raise ArgumentError, "file not found: #{orig_f}"
       end
 
+      # Gets list of files from base directory and given files. Changes input `files` array.
       def non_options(files, options)
-        paths = [options.delete(:base_directory), nil].uniq
-        if reject = options.delete(:reject)
-          reject_pat = Regexp.union(reject.map {|r| %r"#{r}"})
+        @orig_files = files.dup
+        if worker_process?
+          return super(files, options)
         end
+        paths = [options[:base_directory], nil].uniq
+        if exclude_pats = options[:exclude_file_patterns]
+          exclude_re = Regexp.union(exclude_pats.map {|r| %r"#{r}"})
+        end
+        custom_basedir = options[:base_directory] if options[:base_directory] != DEFAULT_TEST_DIR
+        if custom_basedir && files == DEFAULT_TEST_DIR
+          files.replace([custom_basedir.dup])
+        elsif custom_basedir && files != DEFAULT_TEST_DIR
+          files << custom_basedir.dup
+          files.uniq!
+        end
+        #STDERR.print "files: ", files, "\n"
         files.map! {|f|
           f = f.tr(File::ALT_SEPARATOR, File::SEPARATOR) if File::ALT_SEPARATOR
           orig_f = f
           while true
-            ret = ((paths if /\A\.\.?(?:\z|\/)/ !~ f) || [nil]).any? do |prefix|
+            #STDERR.print 'f: ', f.inspect, "\n"
+            ret = paths.any? do |prefix|
+              #STDERR.print 'prefix: ', prefix.inspect, "\n"
+              #STDERR.print 'paths: ', paths.inspect, "\n"
+              abs_file_no_prefix = false
               if prefix
-                path = f.empty? ? prefix : "#{prefix}/#{f}"
+                if File.absolute_path?(f)
+                  path = f
+                  abs_file_no_prefix = true
+                else
+                  path = if f.empty?
+                           prefix
+                         else
+                           path_made = "#{prefix}/#{f}"
+                           if File.exist?(File.expand_path(path_made))
+                             path_made
+                           elsif File.exist?(File.expand_path(f))
+                             abs_file_no_prefix = true
+                             File.expand_path(f) # file exists outside base directory
+                           else
+                             next
+                           end
+                         end
+                  #STDERR.print 'made path: ', path, "\n"
+                end
               else
                 next if f.empty?
                 path = f
               end
-              if f.end_with?(File::SEPARATOR) or !f.include?(File::SEPARATOR) or File.directory?(path)
-                match = (Dir["#{path}/**/#{@@testfile_prefix}_*.rb"] + Dir["#{path}/**/*_#{@@testfile_suffix}.rb"]).uniq
+              #STDERR.print "paths: ", paths.inspect, "\n"
+              #STDERR.print "prefix: ", prefix.inspect, "\n"
+              #STDERR.print "f: ", f.inspect, "\n"
+              #STDERR.print "path: ", path.inspect, "\n"
+
+              path_is_dir = Dir.exist?(path)
+
+              dir = path_is_dir ? path : nil
+              if dir
+                match = (Dir["#{dir}/**/#{@@testfile_prefix}_*.rb"] + Dir["#{dir}/**/*_#{@@testfile_suffix}.rb"]).uniq
               else
                 match = Dir[path]
               end
+
               if !match.empty?
-                if reject
+                if exclude_pats
                   match.reject! {|n|
-                    n = n[(prefix.length+1)..-1] if prefix
-                    reject_pat =~ n
+                    n = if abs_file_no_prefix
+                      n
+                    else
+                      n[(prefix.length+1)..-1] if prefix
+                    end
+                    exclude_re =~ n
                   }
                 end
                 break match
-              elsif !reject or reject_pat !~ f and File.exist? path
+              elsif !exclude_pats or exclude_re !~ f and File.exist? path
                 break path
               end
             end
+
             if !ret
               f = complement_test_name(f, orig_f)
             else
@@ -1240,6 +1318,8 @@ module Test
           end
         }
         files.flatten!
+        files.uniq!
+        #STDERR.puts "new files: #{files.size}"
         super(files, options)
       end
     end
@@ -1359,30 +1439,17 @@ module Test
       end
     end
 
-    # FIXME: this is a weird way to exclude test methods
+    # FIXME: this is a weird way to exclude test methods.
+    # TODO: test if it works for parallel workers, I think it does
     module ExcludesOption # :nodoc: all
+      def initialize(*, &blk)
+        @excludes = {}
+        super
+      end
+
       class ExcludedMethods < Struct.new(:excludes)
         def exclude(name, reason)
           excludes[name] = reason
-        end
-
-        def exclude_from(klass)
-          excludes = self.excludes
-          pattern = excludes.keys.grep(Regexp).tap {|k|
-            break (Regexp.new(k.join('|')) unless k.empty?)
-          }
-          klass.class_eval do
-            public_instance_methods(false).each do |method|
-              if excludes[method] or (pattern and pattern =~ method)
-                remove_method(method)
-              end
-            end
-            public_instance_methods(true).each do |method|
-              if excludes[method] or (pattern and pattern =~ method)
-                undef_method(method)
-              end
-            end
-          end
         end
 
         def self.load(dirs, name)
@@ -1390,11 +1457,8 @@ module Test
           instance = nil
           dirs.each do |dir|
             path = File.join(dir, name.gsub(/::/, '/') + ".rb")
-            begin
-              src = File.read(path)
-            rescue Errno::ENOENT
-              nil
-            else
+            src = File.read(path) if File.exist?(path)
+            if src
               instance ||= new({})
               instance.instance_eval(src, path)
             end
@@ -1416,8 +1480,8 @@ module Test
       end
 
       def _run_suite(suite, type)
-        if ex = ExcludedMethods.load(@options[:excludes], suite.name)
-          ex.exclude_from(suite)
+        if excluded = ExcludedMethods.load(@options[:excludes], suite.name)
+          (@excludes[[suite.name, type]] ||= {}).merge!(excluded.excludes)
         end
         super
       end
@@ -1599,12 +1663,18 @@ module Test
         header = "#{type}_suite_header"
         puts send(header, suite) if respond_to? header
 
-        filter = @options[:filter]
+        filter = @options[:test_name_filter]
 
         all_test_methods = suite.send "#{type}_methods"
         if filter
           all_test_methods.select! {|method|
             filter === "#{suite}##{method}"
+          }
+        end
+        excludes = @excludes[[suite.name, type]]
+        if excludes
+          all_test_methods.reject! {|method|
+            excludes.any? { |pat, _| pat === method }
           }
         end
         all_test_methods = @order.sort_by_name(all_test_methods)
@@ -1825,12 +1895,15 @@ module Test
 
       def initialize(force_standalone = false, default_dir = nil, argv = ARGV)
         @force_standalone = force_standalone
-        @runner = Runner.new do |files, options|
+        @to_run = nil
+        @runner = Runner.new do |runner, files, options|
           base = options[:base_directory] ||= default_dir
+          base = File.expand_path(base) unless File.absolute_path?(base)
           files << default_dir if files.empty? and default_dir
           @to_run = files
           yield self if block_given?
           $LOAD_PATH.unshift base if base
+          runner.default_dir = default_dir
           files
         end
         Runner.runner = @runner
@@ -1842,8 +1915,9 @@ module Test
       end
 
       def process_args(*args)
+        return if @to_run
         @runner.process_args(*args)
-        !@to_run.empty?
+        @to_run.any?
       end
 
       def run
