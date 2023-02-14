@@ -484,6 +484,15 @@ module Test
           warn "#{@pid}:#{@status.to_s.ljust(7)}:#{@file}: #{e.message}"
         end
 
+        # TODO
+        def quit_and_report
+          return if @io.closed?
+          @quit_called = true
+          @io.puts "quit"
+        rescue Errno::EPIPE => e
+          warn "#{@pid}:#{@status.to_s.ljust(7)}:#{@file}: #{e.message}"
+        end
+
         def kill
           Process.kill(:KILL, @pid)
         rescue Errno::ESRCH
@@ -600,7 +609,7 @@ module Test
           next unless cond&.call(worker)
           begin
             Timeout.timeout(1) do
-              worker.quit
+              worker.quit_and_report
             end
           rescue Errno::EPIPE
           rescue Timeout::Error
@@ -701,20 +710,12 @@ module Test
             return true
           end
           record(fake_class(r[0]), *r[1..-1])
-        when /^_R_: p (.+?)$/ # finished testcase, update job status
+        when /^_R_: p (.+?)$/ # finished testcase (test method), update job status
           match = $1
-          if $1 =~ /\A([EF])/
+          if $1 =~ /\A([EF]) .+/ # error or failure
             ef_match = $1
             match = match[1..-1]
-            #STDERR.puts match
             msg = match.unpack1("m")
-            #$stderr.puts "p #{$1}", msg
-            #$stdout.puts
-            #$stdout.puts
-            #$stdout.puts "MSG", msg
-            #$stdout.puts
-            #$stdout.puts
-            #STDERR.puts "ARGS", args.inspect
             @report << msg
             del_status_line
             print ef_match
@@ -734,7 +735,7 @@ module Test
           else
             after_worker_down worker
           end
-        else # probably a warning in a sub-process, as $stderr is connected to $stdout
+        else # probably a warning in a sub-process, or a leakcheck report
           del_status_line
           $stdout.puts "#{cmd}"
         end
@@ -772,11 +773,17 @@ module Test
 
           while true
             timeout = [(@workers.filter_map {|w| w.response_at}.min&.-(Time.now) || 0) + @worker_timeout, 1].max
+            # XXX: remove me
+            #@worker_timeout = 5
+            #timeout = 5
 
             if !(_io = IO.select(@ios, nil, nil, timeout))
-              timeout = Time.now - @worker_timeout
-              quit_workers {|w| w.response_at&.<(timeout) }&.each {|w|
-                rep << {file: w.real_file, result: nil, testcase: w.current[0], error: w.current}
+              timeout_time = Time.now - @worker_timeout
+              # TODO: we don't need to quit a worker if a testcase timed out,
+              # we only need to skip to the next test case. If it times out
+              # more than once for a suite, then quit.
+              quit_workers { |w| w.response_at&.<(timeout_time) }&.each {|w|
+                rep << {file: w.real_file, result: nil, testcase: w.current[0], timeout_error: w.current}
               }
             elsif _io.first.any? {|io|
               @need_quit or
@@ -825,45 +832,51 @@ module Test
             del_status_line
             parallel = @options[:parallel]
             @options[:parallel] = false
-            suites, rep = rep.partition {|r|
+            orig_rep = rep
+            failed_suites, rep = rep.partition {|r|
               r[:testcase] && r[:file] &&
                 (!r.key?(:report) || r[:report].any? {|e| !e[2].is_a?(Test::Unit::PendedError)})
             }
-            suites.map {|r| File.realpath(r[:file])}.uniq.each {|file| require file}
-            error, suites = suites.partition {|r| r[:error]}
+            failed_suites.map {|r| File.realpath(r[:file])}.uniq.each {|file| require file}
+            timed_out_suites, failed_suites = failed_suites.partition {|r| r[:timeout_error]}
 
             # Report about the run before retrying
-            if suites.any? || error.any?
+            if failed_suites.any? || timed_out_suites.any?
               test_count = assertions = errors = failures = skips = 0
+              # NOTE: if a test case timed out, we don't have this info for that suite
               result.each do |r|
                 test_count += r[0]
                 assertions += r[1]
               end
-              rep.each do |r|
-                errors   += r[:result][0]
-                failures += r[:result][1]
-                skips    += r[:result][2]
+              orig_rep.each do |r|
+                # NOTE: if a test case timed out, we don't have this info for that suite
+                if r[:result]
+                  errors   += r[:result][0]
+                  failures += r[:result][1]
+                  skips    += r[:result][2]
+                end
               end
               del_status_line
               puts "\nFinished%s %ss in %.6fs, %.4f tests/s, %.4f assertions/s.\n" %
                 [(@repeat_count ? "(#{@@current_repeat_count}/#{@repeat_count}) " : ""), type,
                  t, test_count.fdiv(t), assertions.fdiv(t)]
               puts "#{test_count} tests, #{assertions} assertions, #{failures} failures, #{errors} errors, #{skips} skips"
+              puts "#{timed_out_suites.size} timeouts" if timed_out_suites.any?
             end
 
-            unless suites.empty?
+            if failed_suites.any?
               puts "\n""Retrying files:"
-              suites.each do |r|
+              failed_suites.each do |r|
                 puts "  #{r[:file]} (#{r[:result][1]} failures, #{r[:result][0]} errors)"
               end
               puts "\n"
               @verbose = options[:verbose]
-              suites.map! {|r| ::Object.const_get(r[:testcase])}
-              _run_suites(suites, type)
+              failed_suites.map! {|r| ::Object.const_get(r[:testcase])}
+              _run_suites(failed_suites, type)
             end
-            unless error.empty?
+            if timed_out_suites.any?
               puts "\n""Retrying hung up testcases..."
-              error = error.map do |r|
+              timed_out_suites = timed_out_suites.map do |r|
                 begin
                   ::Object.const_get(r[:testcase])
                 rescue NameError
@@ -880,7 +893,7 @@ module Test
               job_status = @options[:job_status]
               @options[:verbose] = @verbose = true
               @options[:job_status] = :normal
-              result.concat _run_suites(error, type)
+              result.concat _run_suites(timed_out_suites, type)
               @options[:verbose] = @verbose = verbose
               @options[:job_status] = job_status
             end
@@ -889,10 +902,10 @@ module Test
           unless @options[:retry]
             del_status_line or puts
           end
-          unless rep.empty?
+          if rep.any?
             rep.each do |r|
-              if r[:error]
-                puke(*r[:error], Timeout::Error.new)
+              if r[:timeout_error]
+                puke(*r[:timeout_error], Timeout::Error.new)
                 next
               end
               r[:report]&.each do |f|
@@ -908,7 +921,7 @@ module Test
               end
             end
           end
-          unless @warnings.empty?
+          if @warnings.any?
             warn ""
             @warnings.uniq! {|w| w[1].message}
             @warnings.each do |w|
