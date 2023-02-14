@@ -2,7 +2,7 @@
 class LeakChecker
   @@try_lsof = nil # not-tried-yet
 
-  def initialize
+  def initialize(output: $stderr, use_buffered_output: false)
     @fd_info = find_fds
     @@skip = false
     @tempfile_info = find_tempfiles
@@ -11,6 +11,9 @@ class LeakChecker
     @encoding_info = find_encodings
     @old_verbose = $VERBOSE
     @old_warning_flags = find_warning_flags
+    @output = output
+    @use_buffered_output = use_buffered_output
+    @output_buffer = []
   end
 
   def check(test_name)
@@ -28,6 +31,7 @@ class LeakChecker
       check_verbose(test_name),
       check_warning_flags(test_name),
     ]
+    flush_buffered_output if @use_buffered_output
     GC.start if leaks.any?
   end
 
@@ -113,7 +117,11 @@ class LeakChecker
       }
       unless fd_leaked.empty?
         unless @@try_lsof == false
-          @@try_lsof |= system(*%W[lsof -a -d #{fd_leaked.minmax.uniq.join("-")} -p #$$], out: Test::Unit::Runner.output)
+          i, o = IO.pipe
+          @@try_lsof |= system(*%W[lsof -a -d #{fd_leaked.minmax.uniq.join("-")} -p #$$], out: o)
+          o.close
+          puts i.read
+          i.close
         end
       end
       h.each {|fd, list|
@@ -306,11 +314,23 @@ class LeakChecker
   end
 
   def puts(*a)
-    output = Test::Unit::Runner.output
-    if defined?(output.set_encoding)
-      output.set_encoding(nil, nil)
+    if @use_buffered_output
+      @output_buffer.concat a
+      return
     end
-    output.puts(*a)
+    if defined?(@output.set_encoding)
+      @output.set_encoding(nil, nil)
+    end
+    @output.puts(*a)
+  end
+
+  def flush_buffered_output
+    return if @output_buffer.empty?
+    if defined?(@output.set_encoding)
+      @output.set_encoding(nil, nil)
+    end
+    @output.puts @output_buffer.join("\n")
+    @output_buffer.clear
   end
 
   def self.skip

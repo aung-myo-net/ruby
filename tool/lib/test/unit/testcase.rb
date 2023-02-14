@@ -250,6 +250,15 @@ module Test
         public_instance_methods(true).grep(/^test_/)
       end
 
+      def self.method_added(name)
+        super
+        return unless name.to_s.start_with?("test_")
+        if @test_methods[name]
+          raise AssertionFailedError, "test/unit: method #{ self }##{ name } is redefined"
+        end
+        @test_methods[name] = true
+      end
+
       ##
       # Returns true if the test passed.
 
@@ -273,13 +282,11 @@ module Test
         false
       end
 
-      def self.method_added(name)
-        super
-        return unless name.to_s.start_with?("test_")
-        if @test_methods[name]
-          raise AssertionFailedError, "test/unit: method #{ self }##{ name } is redefined"
+      def warn(*args, **kwargs)
+        if !kwargs[:uplevel]
+          kwargs.merge!(uplevel: 1)
         end
-        @test_methods[name] = true
+        super
       end
 
       private

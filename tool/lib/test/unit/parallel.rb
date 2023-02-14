@@ -58,7 +58,7 @@ module Test
               outbuf = buf
               # We want outbuf to be 1 character so that if it's 'E' or 'F',
               # we send the error message with it. See `_report`
-              if (!@verbose) && buf.size > 1
+              if outbuf =~ /\A[EF]/ && !@verbose && buf.size > 1 && @report.size > 0
                 readbuf.concat buf[1..-1].chars
                 outbuf = buf[0]
               end
@@ -108,12 +108,12 @@ module Test
       end
 
       def _report(res, *args) # :nodoc:
-        if res == "p" && args[0] =~ /\A[EF]/ && @report.size > 0
+        if res == "p" && args[0] && args[0] =~ /\A[EF]\z/ && @report.size > 0
           args << @report.shift # the error message
-          @stdout.write("#{res} #{args[0]} #{args[1..-1].pack("m0")}\n")
+          @stdout.write("_R_: #{res} #{args[0]} #{args[1..-1].pack("m0")}\n")
           return true
         end
-        @stdout.write(args.empty? ? "#{res}\n" : "#{res} #{args.pack("m0")}\n")
+        @stdout.write(args.empty? ? "_R_: #{res}\n" : "_R_: #{res} #{args.pack("m0")}\n")
         true
       rescue Errno::EPIPE
       rescue TypeError => e
@@ -201,7 +201,7 @@ module Test
       end
 
       def record(suite, method, assertions, time, error) # :nodoc:
-        #return unless need_records?
+        return unless need_records?
         case error
         when nil
         when Test::Unit::AssertionFailedError, Test::Unit::PendedError

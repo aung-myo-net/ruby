@@ -406,7 +406,7 @@ module Test
           io = IO.popen([*ruby, "-W1",
                         "#{__dir__}/unit/parallel.rb",
                         *("--timeout-scale=#{scale}" if scale),
-                        *args], "rb+")
+                        *args, { err: [:child, :out] }], "rb+")
           new(io, io.pid, :waiting)
         end
 
@@ -651,9 +651,9 @@ module Test
         case cmd
         when ''
           # just only dots, ignore
-        when /^okay$/ # about to run suite
+        when /^_R_: okay$/ # about to run suite
           worker.status = :running
-        when /^ready(!)?$/ # ready to run suite
+        when /^_R_: ready(!)?$/ # ready to run suite
           bang = $1
           worker.status = :ready
 
@@ -669,9 +669,9 @@ module Test
           @test_count += 1
 
           jobs_status(worker)
-        when /^start (.+?)$/ # start of method, set current test case of worker
+        when /^_R_: start (.+?)$/ # start of method, set current test case of worker
           worker.current = Marshal.load($1.unpack1("m"))
-        when /^done (.+?)$/ # done running suite, collect results
+        when /^_R_: done (.+?)$/ # done running suite, collect results
           begin
             r = Marshal.load($1.unpack1("m"))
           rescue
@@ -684,7 +684,7 @@ module Test
           jobs_status(worker) if @options[:job_status] == :replace
 
           return true
-        when /^record (.+?)$/ # recorded hook
+        when /^_R_: record (.+?)$/ # recorded hook
           raise "records shouldn't be on" unless need_records?
           begin
             r = Marshal.load($1.unpack1("m"))
@@ -701,11 +701,11 @@ module Test
             return true
           end
           record(fake_class(r[0]), *r[1..-1])
-        when /^p (.+?)$/ # update job status, print output if necessary
+        when /^_R_: p (.+?)$/ # finished testcase, update job status
           match = $1
-          if $1 =~ /\A([EF]+)/
+          if $1 =~ /\A([EF])/
             ef_match = $1
-            match = match[$1.size..-1]
+            match = match[1..-1]
             #STDERR.puts match
             msg = match.unpack1("m")
             #$stderr.puts "p #{$1}", msg
@@ -720,21 +720,23 @@ module Test
             print ef_match
             jobs_status(worker) if @options[:job_status] == :replace
           else
+            del_status_line
             print match.unpack1("m")
             jobs_status(worker) if @options[:job_status] == :replace
           end
-        when /^after (.+?)$/ # couldn't load test file
+        when /^_R_: after (.+?)$/ # couldn't load test file
           @warnings << Marshal.load($1.unpack1("m"))
-        when /^bye (.+?)$/ # exception in worker
+        when /^_R_: bye (.+?)$/ # exception in worker
           after_worker_down worker, Marshal.load($1.unpack1("m"))
-        when /^bye$/, nil
+        when /^_R_: bye$/, nil
           if shutting_down || worker.quit_called
             after_worker_quit worker
           else
             after_worker_down worker
           end
-        else
-          print "unknown command: #{cmd.dump}\n"
+        else # probably a warning in a sub-process, as $stderr is connected to $stdout
+          del_status_line
+          $stdout.puts "#{cmd}"
         end
         return false
       end
@@ -764,6 +766,7 @@ module Test
         @workers_hash = {} # out-IO => worker
         @ios          = [] # Array of worker IOs
         @job_tokens   = String.new(encoding: Encoding::ASCII_8BIT) if @jobserver
+        start = Time.now
         begin
           [@tasks.size, @options[:parallel]].min.times {launch_worker}
 
@@ -815,9 +818,11 @@ module Test
           quit_workers
           flush_job_tokens
 
+          t = Time.now - start
+
           # Retry suites that failed in this process
           if !@interrupt && !@need_quit && @options[:retry]
-            del_status_line or puts
+            del_status_line
             parallel = @options[:parallel]
             @options[:parallel] = false
             suites, rep = rep.partition {|r|
@@ -826,8 +831,32 @@ module Test
             }
             suites.map {|r| File.realpath(r[:file])}.uniq.each {|file| require file}
             error, suites = suites.partition {|r| r[:error]}
+
+            # Report about the run before retrying
+            if suites.any? || error.any?
+              test_count = assertions = errors = failures = skips = 0
+              result.each do |r|
+                test_count += r[0]
+                assertions += r[1]
+              end
+              rep.each do |r|
+                errors   += r[:result][0]
+                failures += r[:result][1]
+                skips    += r[:result][2]
+              end
+              del_status_line
+              puts "\nFinished%s %ss in %.6fs, %.4f tests/s, %.4f assertions/s.\n" %
+                [(@repeat_count ? "(#{@@current_repeat_count}/#{@repeat_count}) " : ""), type,
+                 t, test_count.fdiv(t), assertions.fdiv(t)]
+              puts "#{test_count} tests, #{assertions} assertions, #{failures} failures, #{errors} errors, #{skips} skips"
+            end
+
             unless suites.empty?
-              puts "\n""Retrying..."
+              puts "\n""Retrying files:"
+              suites.each do |r|
+                puts "  #{r[:file]} (#{r[:result][1]} failures, #{r[:result][0]} errors)"
+              end
+              puts "\n"
               @verbose = options[:verbose]
               suites.map! {|r| ::Object.const_get(r[:testcase])}
               _run_suites(suites, type)
@@ -1848,7 +1877,7 @@ module Test
         end
         all_test_methods = @order.sort_by_name(all_test_methods)
 
-        leakchecker = LeakChecker.new
+        leakchecker = LeakChecker.new(output: self.class.output, use_buffered_output: worker_process?)
         if ENV["LEAK_CHECKER_TRACE_OBJECT_ALLOCATION"]
           require "objspace"
           trace = true
