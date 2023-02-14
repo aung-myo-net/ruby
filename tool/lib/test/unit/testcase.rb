@@ -145,7 +145,7 @@ module Test
       def run runner
         trap "INFO" do
           _on_info_signal_during_run(runner)
-        end if runner.info_signal
+        end if runner.info_signal && !on_parallel_worker?
 
         start_time = Time.now
 
@@ -180,7 +180,7 @@ module Test
               result = runner.puke self.class, @__name__, e
             end
           end
-          trap 'INFO', 'DEFAULT' if runner.info_signal
+          trap 'INFO', 'DEFAULT' if runner.info_signal && !on_parallel_worker?
         end
         result
       end
@@ -283,6 +283,7 @@ module Test
       end
 
       private
+
       def _on_info_signal_during_run(runner)
         runner.report.each_with_index do |msg, i|
           warn "\n%3d) %s" % [i + 1, msg]

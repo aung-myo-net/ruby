@@ -20,6 +20,8 @@ module Test
       undef _run_suites
       undef run
 
+      private
+
       def worker_process?
         true
       end
@@ -49,11 +51,18 @@ module Test
         orig_stdin, orig_stdout = $stdin, $stdout
 
         th = Thread.new do
+          readbuf = []
           begin
-            while buf = (self.verbose ? i.gets : i.readpartial(1024))
-              if @verbose
-                _report "p", buf or break
+            # buf here is '.', 'S', 'E', 'F' unless in verbose mode
+            while buf = (readbuf.shift || (@verbose ? i.gets : i.readpartial(1024)))
+              outbuf = buf
+              # We want outbuf to be 1 character so that if it's 'E' or 'F',
+              # we send the error message with it. See `_report`
+              if (!@verbose) && buf.size > 1
+                readbuf.concat buf[1..-1].chars
+                outbuf = buf[0]
               end
+              _report "p", outbuf
             end
           rescue IOError
           end
@@ -97,6 +106,21 @@ module Test
         o.close if o && !o.closed?
         i.close if i && !i.closed?
       end
+
+      def _report(res, *args) # :nodoc:
+        if res == "p" && args[0] =~ /\A[EF]/ && @report.size > 0
+          args << @report.shift # the error message
+          @stdout.write("#{res} #{args[0]} #{args[1..-1].pack("m0")}\n")
+          return true
+        end
+        @stdout.write(args.empty? ? "#{res}\n" : "#{res} #{args.pack("m0")}\n")
+        true
+      rescue Errno::EPIPE
+      rescue TypeError => e
+        abort("#{e.inspect} in _report(#{res.inspect}, #{args.inspect})\n#{e.backtrace.join("\n")}")
+      end
+
+      public
 
       # entire worker run, runs multiple suites (files)
       def run(args = []) # :nodoc:
@@ -166,14 +190,6 @@ module Test
         end
       end
 
-      def _report(res, *args) # :nodoc:
-        @stdout.write(args.empty? ? "#{res}\n" : "#{res} #{args.pack("m0")}\n")
-        true
-      rescue Errno::EPIPE
-      rescue TypeError => e
-        abort("#{e.inspect} in _report(#{res.inspect}, #{args.inspect})\n#{e.backtrace.join("\n")}")
-      end
-
       def puke(klass, meth, e) # :nodoc:
         if e.is_a?(Test::Unit::PendedError)
           new_e = Test::Unit::PendedError.new(e.message)
@@ -185,7 +201,7 @@ module Test
       end
 
       def record(suite, method, assertions, time, error) # :nodoc:
-        return unless need_records?
+        #return unless need_records?
         case error
         when nil
         when Test::Unit::AssertionFailedError, Test::Unit::PendedError
