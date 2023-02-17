@@ -154,6 +154,7 @@ module Test
 
         begin
           @_passed = nil
+          @_interrupted = nil
           self.before_setup
           self.setup
           self.after_setup

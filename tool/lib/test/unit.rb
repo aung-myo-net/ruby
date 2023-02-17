@@ -369,9 +369,9 @@ module Test
           options[:worker_timeout] = a
         end
 
-        opts.on '--separate', "Restart job process after one testcase has done" do
+        opts.on '--separate', "Restart job process after one testcase (file) has finished" do
           options[:parallel] ||= 1
-          options[:separate] = true
+          options[:separate_worker_per_suite] = true
         end
 
         opts.on '--retry', "Retry running testcase when --jobs specified" do
@@ -408,12 +408,19 @@ module Test
 
       class Worker # :nodoc: all
         def self.launch(ruby,args=[])
+          old_report_on_exception = Thread.current.report_on_exception
+          # IO.popen spawns a new thread that will inherit this value, because
+          # we don't want it to output any errors, which usually happens
+          # during interrupts (ctrl-c)
+          Thread.current.report_on_exception = false
           scale = EnvUtil.timeout_scale
           io = IO.popen([*ruby, "-W1",
                         "#{__dir__}/unit/parallel.rb",
                         *("--timeout-scale=#{scale}" if scale),
                         *args, { err: [:child, :out] }], "rb+")
           new(io, io.pid, :waiting)
+        ensure
+          Thread.current.report_on_exception = old_report_on_exception
         end
 
         attr_reader :num, :io, :pid, :real_file, :quit_called, :response_at
@@ -571,9 +578,11 @@ module Test
       def after_worker_down(worker, e=nil, c=false)
         return unless @options[:parallel]
         return if @interrupt
+        del_status_line
         flush_job_tokens
         warn e if e
-        real_file = worker.real_file and warn "while running file: #{real_file}"
+        warn ""
+        real_file = worker.real_file and warn "Error while running file: #{real_file}"
         warn ""
         warn "A test worker crashed at #{worker.current_test_name}. It might be an interpreter bug or"
         warn "a bug in test/unit/parallel.rb. Try again without the -j"
@@ -721,14 +730,14 @@ module Test
         when /^_R_: okay$/ # about to run suite
           worker.status = :running
         when /^_R_: ready(!)?$/ # ready to run suite
-          bang = $1
+          bang = $1 # the ! means it hasn't run any suites before
           worker.status = :ready
 
           unless task = @tasks.shift
             worker.quit
             return nil
           end
-          if @options[:separate] and not bang
+          if @options[:separate_worker_per_suite] and not bang
             worker.quit
             worker = launch_worker
           end
@@ -771,19 +780,21 @@ module Test
             return true
           end
           record(fake_class(r[0]), *r[1..-1])
-        when /^_R_: p (.+?)$/ # finished testcase (test method), update job status
+        when /^_R_: p (.+?)$/ # test runner output, like '.' or 'E'
           match = $1
           if match =~ /\A([EF]) .+/ # error or failure in non-verbose mode
             ef_match = $1
             msg = match[1..-1]
             msg = msg.unpack1("m")
-            @report << msg
-            del_status_line
-            efs_change = print ef_match # print the error or failure
-            if efs_change != [0,0,0]
-              worker.suite_errors += efs_change[0]
-              worker.suite_failures += efs_change[1]
-              worker.suite_skips += efs_change[2]
+            @report << msg unless @interrupt
+            unless @interrupt
+              del_status_line
+              efs_change = print(ef_match) # print the error or failure
+              if efs_change != [0,0,0]
+                worker.suite_errors += efs_change[0]
+                worker.suite_failures += efs_change[1]
+                worker.suite_skips += efs_change[2]
+              end
             end
             jobs_status(worker) if @options[:job_status] == :replace
           else
@@ -798,11 +809,19 @@ module Test
             jobs_status(worker) if @options[:job_status] == :replace
           end
         when /^_R_: after (.+?)$/ # couldn't load test file
-          @warnings << Marshal.load($1.unpack1("m"))
+          unless @interrupt
+            w = Marshal.load($1.unpack1("m"))
+            unless @warnings.include?(w[1].message)
+              warn "#{w[0]}: #{w[1].message} (#{w[1].class})"
+              @warnings << w[1].message
+            end
+          end
         when /^_R_: bye (.+?)$/ # exception in worker
-          worker.status = :exited
-          error_msg = Marshal.load($1.unpack1("m"))
-          after_worker_down worker, error_msg
+          unless @interrupt
+            worker.status = :exited
+            error_msg = Marshal.load($1.unpack1("m"))
+            after_worker_down worker, error_msg
+          end
           return true
         when /^_R_: bye$/, nil
           worker.status = :exited
@@ -999,14 +1018,6 @@ module Test
                 @skips    += s
               end
             end
-          end
-          if @warnings.any?
-            warn ""
-            @warnings.uniq! {|w| w[1].message}
-            @warnings.each do |w|
-              warn "#{w[0]}: #{w[1].message} (#{w[1].class})"
-            end
-            warn ""
           end
         end
       end
