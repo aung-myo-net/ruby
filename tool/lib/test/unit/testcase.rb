@@ -141,7 +141,8 @@ module Test
                                 Interrupt, SystemExit] # :nodoc:
       TEARDOWN_HOOKS = [:before_teardown, :teardown, :after_teardown]
 
-      # Run a single test method
+      # Run a single test method.
+      # Returns string of length 1, one of: .|S|F|E|T
       def run runner
         trap "INFO" do
           _on_info_signal_during_run(runner)
@@ -161,7 +162,8 @@ module Test
           time = Time.now - start_time
           runner.record self.class, @__name__, @_assertions, time, nil
           @_passed = true
-        rescue *PASSTHROUGH_EXCEPTIONS
+        rescue *PASSTHROUGH_EXCEPTIONS => e
+          @_interrupted = e if e.is_a?(Interrupt)
           raise
         rescue Exception => e
           @_passed = Test::Unit::PendedError === e
@@ -169,15 +171,18 @@ module Test
           runner.record self.class, @__name__, @_assertions, time, e
           result = runner.puke self.class, @__name__, e
         ensure
-          TEARDOWN_HOOKS.each do |hook|
-            begin
-              self.send hook
-            rescue *PASSTHROUGH_EXCEPTIONS
-              raise
-            rescue Exception => e
-              @_passed = false
-              runner.record self.class, @__name__, @_assertions, time, e
-              result = runner.puke self.class, @__name__, e
+          # If we run the teardown hooks after an interrupt, we get lots of errors
+          unless @_interrupted
+            TEARDOWN_HOOKS.each do |hook|
+              begin
+                self.send hook
+              rescue *PASSTHROUGH_EXCEPTIONS
+                raise
+              rescue Exception => e
+                @_passed = false
+                runner.record self.class, @__name__, @_assertions, time, e
+                result = runner.puke self.class, @__name__, e
+              end
             end
           end
           trap 'INFO', 'DEFAULT' if runner.info_signal && !on_parallel_worker?
@@ -254,7 +259,7 @@ module Test
         super
         return unless name.to_s.start_with?("test_")
         if @test_methods[name]
-          raise AssertionFailedError, "test/unit: method #{ self }##{ name } is redefined"
+          raise AssertionFailedError, "test/unit: method #{self}##{name} is redefined"
         end
         @test_methods[name] = true
       end
@@ -280,13 +285,6 @@ module Test
 
       def on_parallel_worker?
         false
-      end
-
-      def warn(*args, **kwargs)
-        if !kwargs[:uplevel]
-          kwargs.merge!(uplevel: 1)
-        end
-        super
       end
 
       private

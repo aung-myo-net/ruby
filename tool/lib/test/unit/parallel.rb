@@ -39,11 +39,12 @@ module Test
       end
 
       def _start_method(inst)
-        _report "start", Marshal.dump([inst.class.name, inst.__name__])
+        _report "start", Marshal.dump([inst.class.name, inst.__name__, @last_test_assertions])
       end
 
       def _run_suite(suite, type) # :nodoc:
         @partial_report = []
+        @last_test_assertions = 0
         orig_testout = Test::Unit::Runner.output
         i,o = IO.pipe
 
@@ -62,7 +63,7 @@ module Test
                 readbuf.concat buf[1..-1].chars
                 outbuf = buf[0]
               end
-              _report "p", outbuf
+              _report "p", outbuf unless @need_exit
             end
           rescue IOError
           end
@@ -74,6 +75,8 @@ module Test
 
         begin
           result = orig_run_suite(suite, type)
+        # Using a terminal, interrupt signal by ctrl-c is sent to all processes in
+        # foreground process group, so even child processes get the signal.
         rescue Interrupt
           @need_exit = true
           result = [nil,nil]
@@ -107,6 +110,10 @@ module Test
         i.close if i && !i.closed?
       end
 
+      # We namespace the reporting with "_R_: " because other messages could
+      # be sent to $stdout that aren't through this function, and they will be
+      # received by the parent process. We need to be able to distinguish these
+      # other messages from worker reports.
       def _report(res, *args) # :nodoc:
         if res == "p" && args[0] && args[0] =~ /\A[EF]\z/ && @report.size > 0
           args << @report.shift # the error message
@@ -148,20 +155,24 @@ module Test
               @old_loadpath = $:.dup
               $:.push(*Marshal.load($1.unpack1("m").force_encoding("ASCII-8BIT"))).uniq!
             when /^run (.+?) (.+?)$/
+              suite_file = $1
+              suite_type = $2
               _report "okay"
 
               @options = @opts.dup
-              suites = Test::Unit::TestCase.test_suites
+              old_suites = Test::Unit::TestCase.test_suites
 
               begin
-                require File.realpath($1)
-              rescue LoadError
-                _report "after", Marshal.dump([$1, ProxyError.new($!)])
+                require File.realpath(suite_file)
+              rescue LoadError => e
+                _report "after", Marshal.dump([suite_file, ProxyError.new(e)])
                 _report "ready"
                 next
               end
-              # run the loaded suite (class) in the file
-              _run_suites Test::Unit::TestCase.test_suites - suites, $2.to_sym
+              # NOTE: this array can be empty if the file defined no class, like if there
+              # is a guard around the definition of the class that was not met
+              this_suite_ary = Test::Unit::TestCase.test_suites - old_suites
+              _run_suites this_suite_ary, suite_type.to_sym
 
               if @need_exit
                 _report "bye"
@@ -174,9 +185,16 @@ module Test
               exit
             end
           end
+        rescue Interrupt, SystemExit # do nothing
         rescue Exception => e
           trace = e.backtrace || ['unknown method']
           err = ["#{trace.shift}: #{e.message} (#{e.class})"] + trace.map{|t| "\t" + t }
+
+          # The exception occured as a result of the interrupt
+          if @need_exit
+            _report "bye"
+            exit
+          end
 
           if @stdout
             _report "bye", Marshal.dump(err.join("\n"))
@@ -197,11 +215,11 @@ module Test
           e = new_e
         end
         @partial_report << [klass.name, meth, e.is_a?(Test::Unit::AssertionFailedError) ? e : ProxyError.new(e)]
-        super
+        super # populate @report, @errors, @failures, etc.
       end
 
       def record(suite, method, assertions, time, error) # :nodoc:
-        return unless need_records?
+        return unless recording?
         case error
         when nil
         when Test::Unit::AssertionFailedError, Test::Unit::PendedError
@@ -216,7 +234,6 @@ module Test
           error = ProxyError.new(error)
         end
         _report "record", Marshal.dump([suite.name, method, assertions, time, error])
-        super
       end
     end
   end

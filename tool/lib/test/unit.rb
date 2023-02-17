@@ -99,7 +99,7 @@ module Test
       end
 
       class Alpha < NoSort
-        #include MJITFirst
+        include MJITFirst
 
         def sort_by_name(list)
           list.sort_by(&:name)
@@ -113,7 +113,7 @@ module Test
 
       # shuffle test suites based on CRC32 of their names
       Shuffle = Struct.new(:seed, :salt) do # :nodoc: all
-        #include MJITFirst
+        include MJITFirst
 
         def initialize(seed)
           self.class::CRC_TBL ||= (0..255).map {|i|
@@ -132,6 +132,7 @@ module Test
           list.sort_by {|e| randomize_key(e)}
         end
 
+        # XXX: remove to use MJITFirst
         def group(list)
           list
         end
@@ -299,6 +300,7 @@ module Test
         @worker_timeout = nil
         @interrupt = nil
         @files = nil
+        @last_test_assertions = 0 # Used only in worker process
         super
       end
 
@@ -359,7 +361,7 @@ module Test
         options[:retry] = true
 
         opts.on '-j N', '--jobs N', /\A(t)?(\d+)\z/, "Allow run tests with N jobs at once" do |_, t, a|
-          options[:testing] = true & t # For testing
+          options[:testing_parallel] = true & t # For testing
           options[:parallel] = a.to_i
         end
 
@@ -387,9 +389,13 @@ module Test
         opts.on '--timetable-data=FILE', "Path to timetable data" do |a|
           options[:timetable_data] = a
         end
+
+        opts.on('--silence-worker-output', "Silence worker output such as warnings or leakchecker") do
+          options[:silence_worker_output] = true
+        end
       end
 
-      def need_records?
+      def recording?
         @options[:timetable_data] || super
       end
 
@@ -412,27 +418,44 @@ module Test
 
         attr_reader :num, :io, :pid, :real_file, :quit_called, :response_at
         attr_accessor :start_time, :current, :status
+        attr_accessor :suite_test_count, :suite_assertion_count, :suite_errors, :suite_failures,
+                      :suite_skips
 
         @@worker_number = 0
 
         def initialize(io, pid, status)
           @num = (@@worker_number += 1)
-          @io = io
+          @io = io # stdout/stderr from the worker process
           @pid = pid
-          @status = status
-          @file = nil
-          @real_file = nil
+          @status = status # one of :prepare, :ready, :running, :quit, :exited, :killed
+          @file = nil # current file name being run (base name)
+          @real_file = nil # current file name being run (full path)
           @loadpath = []
           @hooks = {}
           @quit_called = false
-          @need_quit = false
-          @response_at = nil
+          @response_at = nil # last response from worker
           @start_time = nil
-          @current = nil
+          @current = nil # array of ["TestCaseName"", :test_method_name]
+          # Normally suite results are sent by a worker process when it's
+          # finished the suite, but if the worker times out we want access to
+          # this information, so we keep track of it here:
+          @suite_test_count = 0 # number of tests run so far in current suite
+          @suite_assertion_count = 0 # number of assertions made so far in current suite
+          # These numbers are a best-effort attempt, because the output of the worker
+          # is parsed to get them. The real data is sent when the suite is finished.
+          @suite_errors = @suite_failures = @suite_skips = 0
         end
 
         def name
           "Worker #{@num}"
+        end
+
+        def current_test_name
+          if @current
+            "#{@current[0]}##{@current[1]}"
+          else
+            nil
+          end
         end
 
         def puts(*args)
@@ -441,10 +464,13 @@ module Test
 
         # Communicates with worker process to run a test file
         def run(task,type)
+          @suite_test_count = @suite_assertion_count = 0
+          @suite_errors = @suite_failures = @suite_skips = 0
           @file = File.basename(task, ".rb")
+          dir = File.dirname(task)
           @real_file = task
           begin
-            puts "loadpath #{[Marshal.dump($:-@loadpath)].pack("m0")}"
+            puts "loadpath #{[Marshal.dump($:-@loadpath+[dir])].pack("m0")}"
             @loadpath = $:.dup
             puts "run #{task} #{type}"
             @status = :prepare
@@ -476,28 +502,34 @@ module Test
         rescue IOError
         end
 
-        def quit
-          return if @io.closed?
+        # Send "quit" message to worker process. This does not make the process
+        # exit immediately, as it first has to finish its test suite.
+        # TODO: send a signal to the worker instead of sending msg to `io` so
+        # it can respond immediately.
+        def quit(warn_if_closed: true)
+          if @io.closed?
+            @quit_called = true
+            @status = :quit
+            return
+          end
+          return if @quit_called
           @quit_called = true
+          old_status = @status
+          @status = :quit
           @io.puts "quit"
         rescue Errno::EPIPE => e
-          warn "#{@pid}:#{@status.to_s.ljust(7)}:#{@file}: #{e.message}"
-        end
-
-        # TODO
-        def quit_and_report
-          return if @io.closed?
-          @quit_called = true
-          @io.puts "quit"
-        rescue Errno::EPIPE => e
-          warn "#{@pid}:#{@status.to_s.ljust(7)}:#{@file}: #{e.message}"
+          if warn_if_closed
+            warn "Tried to send 'quit' to #{@pid}:#{old_status.to_s.ljust(7)}:#{@file}: #{e.message}"
+          end
         end
 
         def kill
           Process.kill(:KILL, @pid)
+          @status = :killed
         rescue Errno::ESRCH
         end
 
+        # Worker process can no longer be communicated with (may have exited)
         def died(*additional)
           @status = :quit
           @io.close
@@ -506,7 +538,7 @@ module Test
             additional[0] ||= SignalException.new(status.termsig)
           end
 
-          call_hook(:dead,*additional)
+          call_hook(:dead, *additional)
         end
 
         def to_s
@@ -541,10 +573,9 @@ module Test
         return if @interrupt
         flush_job_tokens
         warn e if e
-        real_file = worker.real_file and warn "running file: #{real_file}"
-        @need_quit = true
+        real_file = worker.real_file and warn "while running file: #{real_file}"
         warn ""
-        warn "A test worker crashed. It might be an interpreter bug or"
+        warn "A test worker crashed at #{worker.current_test_name}. It might be an interpreter bug or"
         warn "a bug in test/unit/parallel.rb. Try again without the -j"
         warn "option."
         warn ""
@@ -575,9 +606,8 @@ module Test
         if @jobserver and (token = @job_tokens.slice!(0))
           @jobserver[1] << token
         end
-        @workers.delete(worker)
+        delete_worker(worker)
         @dead_workers << worker
-        @ios = @workers.map(&:io)
       end
 
       def launch_worker
@@ -602,48 +632,75 @@ module Test
         @ios.delete worker.io
       end
 
-      def quit_workers(&cond)
-        return if @workers.empty?
-        closed = [] if cond
+      # Stop the worker processes. If `cond` is given, only
+      # stop the workers that meet this condition. We wait a little
+      # while until the workers have finished their current suite before force
+      # killing them. When this returns, these worker processes will no longer
+      # be running.
+      def quit_workers(reason: nil, timeout: nil, &cond)
+        return @workers if @workers.empty?
+        quit_workers = []
+        killed_workers = []
         @workers.reject! do |worker|
-          next unless cond&.call(worker)
+          if cond
+            next unless cond.call(worker)
+            if reason == :timeout
+              del_status_line
+              $stdout.puts "Timeout in #{worker.current_test_name} after #{timeout} seconds"
+            end
+          end
+          # An interrupt signal might have been sent to child, in which case the child
+          # will already be exited, so we don't want warnings
           begin
             Timeout.timeout(1) do
-              worker.quit_and_report
+              worker.quit(warn_if_closed: false)
             end
-          rescue Errno::EPIPE
           rescue Timeout::Error
-            debug { "Quit timeout expired for worker #{worker.num} (#{worker.pid})" }
           end
-          closed&.push worker
           begin
             Timeout.timeout(0.2) do
               worker.close
             end
           rescue Timeout::Error
-            debug { "Killing worker #{worker.num} (#{worker.pid}) after close timeout expired" }
+            debug { "Killing worker #{worker.pid} after close timeout expired" }
             worker.kill
+            killed_workers << worker
             retry
           end
+          quit_workers << worker
           @ios.delete worker.io
+          @workers_hash.delete worker.io
+          true
         end
 
-        return if (closed ||= @workers).empty?
-        pids = closed.map(&:pid)
+        if quit_workers.empty?
+          return quit_workers
+        end
+        killing = quit_workers - killed_workers
+        return quit_workers if killing.empty? # already killed above
+
+        pids = killing.map(&:pid)
+        exited_pids = []
         begin
-          Timeout.timeout(0.2 * closed.size) do
-            Process.waitall
+          # Wait for suites to finish after call to `quit`. If they've been sent an interrupt signal they will
+          # finish immediately.
+          Timeout.timeout(0.2 * pids.size) do
+            pids.each { |pid|
+              begin
+                Process.waitpid(pid)
+              rescue Errno::ECHILD
+              end
+              exited_pids << pid
+            }
           end
         rescue Timeout::Error
           if pids
-            debug { "Killing worker processes #{pids.map(&:to_s).join(',')} after timeout expired" }
-            Process.kill(:KILL, *pids) rescue nil
-            pids = nil
-            retry
+            debug { "Killing (sig 9) worker processes #{(pids-exited_pids).map(&:to_s).join(',')} after waitpid timeout expired" }
+            Process.kill(:KILL, *(pids-exited_pids)) rescue nil
           end
         end
-        @workers.clear unless cond
-        closed
+        killing.each { |w| w.status = :killed }
+        quit_workers
       end
 
       FakeClass = Struct.new(:name)
@@ -651,7 +708,8 @@ module Test
         (@fake_classes ||= {})[name] ||= FakeClass.new(name)
       end
 
-      # Deal with worker events
+      # Deal with worker events, return `nil` on worker quit, `true` if suite results have
+      # been collected or they cannot be collected (due to error), and `false` otherwise.
       def deal(io, type, result, rep, shutting_down = false)
         worker = @workers_hash[io]
         cmd = worker.read
@@ -679,7 +737,11 @@ module Test
 
           jobs_status(worker)
         when /^_R_: start (.+?)$/ # start of method, set current test case of worker
-          worker.current = Marshal.load($1.unpack1("m"))
+          ary = Marshal.load($1.unpack1("m"))
+          worker.current = ary.first(2)
+          last_test_assertions = ary[2]
+          worker.suite_assertion_count += last_test_assertions
+          worker.suite_test_count += 1
         when /^_R_: done (.+?)$/ # done running suite, collect results
           begin
             r = Marshal.load($1.unpack1("m"))
@@ -691,10 +753,9 @@ module Test
           rep    << {file: worker.real_file, report: r[2], result: r[3], testcase: r[5]}
           $:.push(*r[4]).uniq!
           jobs_status(worker) if @options[:job_status] == :replace
-
           return true
         when /^_R_: record (.+?)$/ # recorded hook
-          raise "records shouldn't be on" unless need_records?
+          raise "records shouldn't be on" unless recording?
           begin
             r = Marshal.load($1.unpack1("m"))
 
@@ -712,38 +773,57 @@ module Test
           record(fake_class(r[0]), *r[1..-1])
         when /^_R_: p (.+?)$/ # finished testcase (test method), update job status
           match = $1
-          if $1 =~ /\A([EF]) .+/ # error or failure
+          if match =~ /\A([EF]) .+/ # error or failure in non-verbose mode
             ef_match = $1
-            match = match[1..-1]
-            msg = match.unpack1("m")
+            msg = match[1..-1]
+            msg = msg.unpack1("m")
             @report << msg
             del_status_line
-            print ef_match
+            efs_change = print ef_match # print the error or failure
+            if efs_change != [0,0,0]
+              worker.suite_errors += efs_change[0]
+              worker.suite_failures += efs_change[1]
+              worker.suite_skips += efs_change[2]
+            end
             jobs_status(worker) if @options[:job_status] == :replace
           else
             del_status_line
-            print match.unpack1("m")
+            status_msg = match.unpack1("m")
+            efs_change = print status_msg # '.' or 'S' or long result if verbose mode
+            if efs_change != [0,0,0]
+              worker.suite_errors += efs_change[0]
+              worker.suite_failures += efs_change[1]
+              worker.suite_skips += efs_change[2]
+            end
             jobs_status(worker) if @options[:job_status] == :replace
           end
         when /^_R_: after (.+?)$/ # couldn't load test file
           @warnings << Marshal.load($1.unpack1("m"))
         when /^_R_: bye (.+?)$/ # exception in worker
-          after_worker_down worker, Marshal.load($1.unpack1("m"))
+          worker.status = :exited
+          error_msg = Marshal.load($1.unpack1("m"))
+          after_worker_down worker, error_msg
+          return true
         when /^_R_: bye$/, nil
+          worker.status = :exited
           if shutting_down || worker.quit_called
             after_worker_quit worker
           else
             after_worker_down worker
           end
-        else # probably a warning in a sub-process, or a leakcheck report
-          del_status_line
-          $stdout.puts "#{cmd}"
+          return true
+        else # probably a warning in a sub-process. $stderr of worker processes gets here
+          unless @options[:silence_worker_output]
+            del_status_line
+            $stdout.puts "#{cmd}"
+            $stdout.flush
+          end
         end
-        return false
+        false
       end
 
       # Initializes the runner to run parallel, and runs all the tests
-      # with a number of workers
+      # in a number of worker processes
       def _run_parallel suites, type, result
         raise if worker_process?
         @records = {}
@@ -753,47 +833,52 @@ module Test
           return
         end
 
-        # Require needed thing for parallel running
         require 'timeout'
         @tasks = @order.group(@order.sort_by_string(@files)) # Array of filenames.
 
-        @need_quit = false
-        @dead_workers = []  # Array of dead workers.
+        @dead_workers = [] # Worker objects that don't have a running process
         @warnings = []
         @total_tests = @tasks.size.to_s(10)
-        rep = [] # FIXME: more good naming
+        rep = [] # report results
 
-        @workers      = [] # Array of workers.
-        @workers_hash = {} # out-IO => worker
+        @workers      = [] # array of Worker objects
+        @workers_hash = {} # out-IO => Worker
         @ios          = [] # Array of worker IOs
         @job_tokens   = String.new(encoding: Encoding::ASCII_8BIT) if @jobserver
         start = Time.now
         begin
-          [@tasks.size, @options[:parallel]].min.times {launch_worker}
-
           while true
-            timeout = [(@workers.filter_map {|w| w.response_at}.min&.-(Time.now) || 0) + @worker_timeout, 1].max
-            # XXX: remove me
+            worker_size = [@tasks.size, @options[:parallel]].min
+            if worker_size > @workers.size
+              (worker_size-@workers.size).times { launch_worker }
+            end
+            # Get the minimum timeout needed based on the oldest Worker#response_at
+            timeout = [(@workers.filter_map {|w| w.response_at || Time.now}.min&.-(Time.now) || 0) + @worker_timeout, 1].max
+            # XXX: just for debugging
             #@worker_timeout = 5
             #timeout = 5
 
             if !(_io = IO.select(@ios, nil, nil, timeout))
               timeout_time = Time.now - @worker_timeout
-              # TODO: we don't need to quit a worker if a testcase timed out,
+              # TODO: we shouldn't quit a worker if a testcase timed out,
               # we only need to skip to the next test case. If it times out
               # more than once for a suite, then quit.
-              quit_workers { |w| w.response_at&.<(timeout_time) }&.each {|w|
-                rep << {file: w.real_file, result: nil, testcase: w.current[0], timeout_error: w.current}
-              }
+              quit_workers(reason: :timeout, timeout: @worker_timeout) { |w| w.response_at && w.response_at < timeout_time }.each  do |w|
+                result << [w.suite_test_count, w.suite_assertion_count, :timeout]
+                rep << {
+                  file: w.real_file, result: [w.suite_errors, w.suite_failures, w.suite_skips],
+                  testcase: w.current[0], timeout_error: w.current
+                }
+              end
             elsif _io.first.any? {|io|
-              @need_quit or
-                (deal(io, type, result, rep).nil? and
-                 !@workers.any? {|x| [:running, :prepare].include? x.status})
+              # no tasks left, break out
+              (deal(io, type, result, rep).nil? and
+               @workers.none? {|x| [:running, :prepare].include? x.status})
             }
               break
             end
             break if @tasks.empty? and @workers.empty?
-            if @jobserver and @job_tokens and !@tasks.empty? and
+            if @jobserver and @job_tokens and @tasks.any? and
                ((newjobs = [@tasks.size, @options[:parallel]].min) > @workers.size or
                 !@workers.any? {|x| x.status == :ready})
               t = @jobserver[0].read_nonblock(newjobs, exception: false)
@@ -816,19 +901,30 @@ module Test
           end
 
           if @interrupt
+            # Get "bye" message from interrupted workers
             @ios.select!{|x| @workers_hash[x].status == :running }
-            while !@ios.empty? && (__io = IO.select(@ios,[],[],10))
-              __io[0].reject! {|io| deal(io, type, result, rep, true)}
+            while @ios.any? && (__io = IO.select(@ios,[],[],10))
+              _io = __io[0][0]
+              @ios.reject! {|io|
+                next unless _io.fileno == io.fileno
+                res = deal(io, type, result, rep, true)
+                res.nil? || res
+              }
             end
           end
 
           quit_workers
           flush_job_tokens
 
-          t = Time.now - start
+          time_taken = Time.now - start
+
+          if @interrupt
+            parallel_report(result, rep, time_taken, type)
+            abort "Interrupted"
+          end
 
           # Retry suites that failed in this process
-          if !@interrupt && !@need_quit && @options[:retry]
+          if @options[:retry]
             del_status_line
             parallel = @options[:parallel]
             @options[:parallel] = false
@@ -842,25 +938,7 @@ module Test
 
             # Report about the run before retrying
             if failed_suites.any? || timed_out_suites.any?
-              test_count = assertions = errors = failures = skips = 0
-              # NOTE: if a test case timed out, we don't have this info for that suite
-              result.each do |r|
-                test_count += r[0]
-                assertions += r[1]
-              end
-              orig_rep.each do |r|
-                # NOTE: if a test case timed out, we don't have this info for that suite
-                if r[:result]
-                  errors   += r[:result][0]
-                  failures += r[:result][1]
-                  skips    += r[:result][2]
-                end
-              end
-              del_status_line
-              puts "\nFinished%s %ss in %.6fs, %.4f tests/s, %.4f assertions/s.\n" %
-                [(@repeat_count ? "(#{@@current_repeat_count}/#{@repeat_count}) " : ""), type,
-                 t, test_count.fdiv(t), assertions.fdiv(t)]
-              puts "#{test_count} tests, #{assertions} assertions, #{failures} failures, #{errors} errors, #{skips} skips"
+              parallel_report(result, orig_rep, time_taken, type)
               puts "#{timed_out_suites.size} timeouts" if timed_out_suites.any?
             end
 
@@ -870,7 +948,7 @@ module Test
                 puts "  #{r[:file]} (#{r[:result][1]} failures, #{r[:result][0]} errors)"
               end
               puts "\n"
-              @verbose = options[:verbose]
+              @verbose = @options[:verbose]
               failed_suites.map! {|r| ::Object.const_get(r[:testcase])}
               _run_suites(failed_suites, type)
             end
@@ -883,7 +961,7 @@ module Test
                   # testcase doesn't specify the correct case, so show `r` for information
                   require 'pp'
 
-                  $stderr.puts "Retrying is failed because the file and testcase is not consistent:"
+                  $stderr.puts "Retrying failed because the file and testcase is not consistent:"
                   PP.pp r, $stderr
                   @errors += 1
                   nil
@@ -893,6 +971,7 @@ module Test
               job_status = @options[:job_status]
               @options[:verbose] = @verbose = true
               @options[:job_status] = :normal
+              result.reject! { |ary| ary[2] == :timeout }
               result.concat _run_suites(timed_out_suites, type)
               @options[:verbose] = @verbose = verbose
               @options[:job_status] = job_status
@@ -943,6 +1022,7 @@ module Test
             begin
               result << _run_suite(suite, type)
             rescue Interrupt => e
+              result << [@suite_test_count, @suite_assertion_count]
               @interrupt = e
               break
             end
@@ -951,11 +1031,32 @@ module Test
         del_status_line
         result
       end
+
+      # Report on all suites ran
+      def parallel_report(result, report, time_taken, type)
+        test_count = assertions = errors = failures = skips = 0
+        result.each do |r|
+          test_count += r[0]
+          assertions += r[1]
+        end
+        report.each do |r|
+          errors   += r[:result][0]
+          failures += r[:result][1]
+          skips    += r[:result][2]
+        end
+        del_status_line
+        puts "\nFinished%s %ss in %.6fs, %.4f tests/s, %.4f assertions/s.\n" %
+          [(@repeat_count ? "(#{@@current_repeat_count}/#{@repeat_count}) " : ""), type,
+           time_taken, test_count.fdiv(time_taken), assertions.fdiv(time_taken)]
+        puts "#{test_count} tests, #{assertions} assertions, #{failures} failures, #{errors} errors, #{skips} skips"
+      end
     end
+
 
     module Skipping # :nodoc: all
       def failed(s)
-        super if !s or @options[:hide_skip]
+        #super if !s or @options[:hide_skip]
+        super
       end
 
       private
@@ -981,6 +1082,7 @@ module Test
         @report.reject!{|r| r.start_with? "Skipped:" } if @options[:hide_skip]
         @report.sort_by!{|r| r.start_with?("Skipped:") ? 0 : \
                            (r.start_with?("Failure:") ? 1 : 2) }
+        # report failures
         failed(nil)
         result
       end
@@ -993,7 +1095,7 @@ module Test
       end
 
       def record(suite, method, assertions, time, error)
-        return unless need_records?
+        return unless recording?
         if stats
           rec = [suite.name, method, assertions, time, error]
           if max = @options[:longest]
@@ -1019,10 +1121,6 @@ module Test
               end
             end
           end
-          trap(:INT) do
-            show_stats[]
-            abort "Interrupted"
-          end
         end
         result = super
         show_stats[] if show_stats
@@ -1042,7 +1140,7 @@ module Test
         end
       end
 
-      def need_records?
+      def recording?
         @options[:longest] || @options[:most_asserted] || super
       end
 
@@ -1055,6 +1153,7 @@ module Test
 
       def stats
         @stats ||= begin
+          stats = nil
           if @options[:longest]
             stats = {longest: []}
           end
@@ -1128,16 +1227,15 @@ module Test
       private
 
       def terminal_width
-        unless @terminal_width
-          begin
-            require 'io/console'
-            width = $stdout.winsize[1]
-          rescue LoadError, NoMethodError, Errno::ENOTTY, Errno::EBADF, Errno::EINVAL
-            width = ENV["COLUMNS"].to_i.nonzero? || 80
-          end
-          width -= 1 if /mswin|mingw/ =~ RUBY_PLATFORM
-          @terminal_width = width
+        return @terminal_width if @terminal_width
+        begin
+          require 'io/console'
+          width = $stdout.winsize[1]
+        rescue LoadError, NoMethodError, Errno::ENOTTY, Errno::EBADF, Errno::EINVAL
+          width = ENV["COLUMNS"].to_i.nonzero? || 80
         end
+        width -= 1 if /mswin|mingw/ =~ RUBY_PLATFORM
+        @terminal_width = width
         @terminal_width
       end
 
@@ -1177,11 +1275,11 @@ module Test
         else
           color = false
         end
-        @colorize = Colorize.new(color, colors_file: File.join(__dir__, "../../colors"))
+        @colorize ||= Colorize.new(color, colors_file: File.join(__dir__, "../../colors"))
         if color or @options[:job_status] == :replace
           @verbose = !@options[:parallel]
         end
-        @output = Output.new(self) unless @options[:testing]
+        @output = Output.new(self) unless @options[:testing_parallel]
         filter = @options[:test_name_filter] || // # match anything
         type = "#{type}_methods"
         total = suites.inject(0) {|n, suite| n + suite.send(type).grep(filter).size}
@@ -1228,7 +1326,10 @@ module Test
         def respond_to_missing?(*a) $stdout.respond_to?(*a) end
         def method_missing(*a, &b) $stdout.__send__(*a, &b) end
 
-        # Update status line of runner if `s` is in expected format
+        NO_REPORT_CHANGE = [0,0,0]
+
+        # Update status line of runner if `s` is in expected format,
+        # returns number of [errors, failures, skips] that the message has
         def print(s)
           case s
           when /\A(.*\#.*) = \z/
@@ -1237,12 +1338,15 @@ module Test
             runner.add_status(" = #$1")
           when /\A\.+\z/
             runner.succeed
-          when /\A\.*[EFS][EFS.]*\z/
+          when /\A\.*([EFS][EFS.]*)\z/
             runner.failed(s)
+            efs = $1
+            return [efs.count('E'), efs.count('F'), efs.count('S')]
           else
             # Warnings, etc.
             $stdout.print(s)
           end
+          return NO_REPORT_CHANGE
         end
       end
     end
@@ -1621,6 +1725,7 @@ module Test
         @report = []
         @errors = @failures = @skips = 0
         @test_count = @assertion_count = 0
+        @suite_test_count = @suite_assertion_count = 0
         @mutex = Thread::Mutex.new
         @info_signal = Signal.list['INFO']
       end
@@ -1635,7 +1740,7 @@ module Test
       @@installed_at_exit ||= false
       @@out = $stdout
       @@after_tests = []
-      @@current_repeat_count = 0
+      @@current_repeat_count = 0 # repeat count of all suites
 
       ##
       # A simple hook allowing you to run a block of code after _all_ of
@@ -1703,6 +1808,9 @@ module Test
         "#<#{self.class.name}: " <<
         instance_variables.filter_map do |var|
           next if var == :@option_parser # too big
+          next if var == :@tasks # too big
+          next if var == :@files # too big
+          next if var == :@workers_hash # too big
           "#{var}=#{instance_variable_get(var).inspect}"
         end.join(", ") << ">"
       end
@@ -1769,6 +1877,8 @@ module Test
         abort 'Interrupted'
       end
 
+      # Add error message to @report array, and update `@skips`, `@failures`, `@errors`
+      # Returns string of length 1, one of: .|S|F|E|T
       def puke klass, meth, e # :nodoc:
         n = @report.size
         e = case e
@@ -1788,9 +1898,9 @@ module Test
               "Error:\n#{klass}##{meth}:\n#{e.class}: #{e.message.b}\n    #{bt}\n"
             end
         @report << e
-        rep = e[0, 1]
+        rep = e[0, 1] # S|F|T|E
         if Test::Unit::PendedError === e and /no message given\z/ =~ e.message
-          @report.slice!(n..-1)
+          @report.slice!(n..-1) # skip without message, treat as pass
           rep = "."
         end
         rep
@@ -1828,7 +1938,7 @@ module Test
         puts
 
         @test_count, @assertion_count = 0, 0
-        test_count = assertion_count = 0
+        test_count = assertion_count = 0 # includes repeat runs of suites
         sync = output.respond_to? :"sync=" # stupid emacs
         old_sync, output.sync = output.sync, true if sync
 
@@ -1896,7 +2006,9 @@ module Test
           trace = true
         end
 
-        assertions = all_test_methods.map { |method|
+        @suite_test_count = 0
+        @suite_assertion_count = 0
+        all_test_methods.each { |method|
           inst = suite.new(method)
           _start_method(inst)
 
@@ -1909,21 +2021,25 @@ module Test
             else
               inst.run self
             end
+          @suite_test_count += 1
+          @last_test_assertions = inst._assertions
 
           print "%.2f s = " % (Time.now - start_time) if @verbose
-          print result
+          print result # single character
           puts if @verbose
-          $stdout.flush
+          self.output.flush
 
           unless defined?(RubyVM::MJIT) && RubyVM::MJIT.enabled? # compiler process is wrongly considered as leak
-            leakchecker.check("#{inst.class}\##{inst.__name__}")
+            unless worker_process? && @options[:silence_worker_output]
+              leakchecker.check("#{inst.class}\##{inst.__name__}")
+            end
           end
 
           _end_method(inst)
 
-          inst._assertions
+          @suite_assertion_count += inst._assertions
         }
-        return assertions.size, assertions.inject(0) { |sum, n| sum + n }
+        return [@suite_test_count, @suite_assertion_count]
       end
 
       def _start_method(inst) # :nodoc:
@@ -1934,10 +2050,9 @@ module Test
 
       ##
       # For performance reasons, records are not always sent across processes
-      # in parallel mode. If you need records, you must override this, even in
-      # non-parallel mode.
+      # in parallel mode. If you need records in parallel mode, you must override this.
 
-      def need_records?
+      def recording?
         not @options[:parallel]
       end
 
