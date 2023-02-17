@@ -811,9 +811,10 @@ module Test
         when /^_R_: after (.+?)$/ # couldn't load test file
           unless @interrupt
             w = Marshal.load($1.unpack1("m"))
+            # TODO: maybe we should treat this as an error
             unless @warnings.include?(w[1].message)
-              warn "#{w[0]}: #{w[1].message} (#{w[1].error_class})"
-              warn ""
+              @failed_output.puts "#{w[1].message} (#{w[1].error_class})"
+              @failed_output.puts ""
               @warnings << w[1].message
             end
           end
@@ -832,7 +833,10 @@ module Test
             after_worker_down worker
           end
           return true
-        else # probably a warning in a sub-process. $stderr of worker processes gets here
+        else
+          # probably a warning in a sub-process. $stderr of worker processes gets here
+          # Also if worker outputs directly to $stdout instead of going through the runner's output
+          # it ends up here.
           unless @options[:silence_worker_output]
             del_status_line
             $stdout.puts "#{cmd}"
@@ -943,16 +947,19 @@ module Test
             abort "Interrupted"
           end
 
+          orig_rep = rep
+          # Failed errors are already output, so we can partition these and re-assign `rep`
+          failed_suites, rep = rep.partition {|r|
+            r[:testcase] && r[:file] &&
+              (!r.key?(:report) || r[:report].any? {|e| !e[2].is_a?(Test::Unit::PendedError)})
+          }
+
           # Retry suites that failed in this process
           if @options[:retry]
+            @report_count = 0
             del_status_line
             parallel = @options[:parallel]
             @options[:parallel] = false
-            orig_rep = rep
-            failed_suites, rep = rep.partition {|r|
-              r[:testcase] && r[:file] &&
-                (!r.key?(:report) || r[:report].any? {|e| !e[2].is_a?(Test::Unit::PendedError)})
-            }
             failed_suites.map {|r| File.realpath(r[:file])}.uniq.each {|file| require file}
             timed_out_suites, failed_suites = failed_suites.partition {|r| r[:timeout_error]}
 
@@ -1000,24 +1007,11 @@ module Test
           end
           unless @options[:retry]
             del_status_line or puts
-          end
-          if rep.any?
-            rep.each do |r|
-              if r[:timeout_error]
-                puke(*r[:timeout_error], Timeout::Error.new)
-                next
-              end
-              r[:report]&.each do |f|
-                puke(*f) if f
-              end
-            end
-            if @options[:retry]
-              rep.each do |x|
-                (e, f, s = x[:result]) or next
-                @errors   += e
-                @failures += f
-                @skips    += s
-              end
+            orig_rep.each do |x|
+              (e, f, s = x[:result]) or next
+              @errors   += e
+              @failures += f
+              @skips    += s
             end
           end
         end
@@ -1201,11 +1195,13 @@ module Test
       end
 
       def new_test(s)
+        raise if worker_process?
         @test_count += 1
         update_status(s)
       end
 
       def add_status(line)
+        raise if worker_process?
         if @options[:job_status] == :replace
           line = line[0...(terminal_width-@status_line_size)]
         end
@@ -1213,10 +1209,14 @@ module Test
         @status_line_size += line.size
       end
 
-      def succeed; del_status_line; end
+      def succeed
+        raise if worker_process?
+        del_status_line
+      end
 
       def failed(s)
-        return if s and @options[:job_status] != :replace
+        raise if worker_process?
+        return if s and @options[:job_status] && @options[:job_status] != :replace
         sep = "\n"
         @report.each do |msg|
           if msg.start_with? "Skipped:"
@@ -1873,7 +1873,7 @@ module Test
         args = process_args args # ARGH!! blame test/unit process_args
         @options.merge! args
 
-        puts "Run options: #{@help}"
+        puts "Run options:#{@help}"
         if req = @options.delete(:requirer)
           puts "\n# Loading test files"
           req.call
@@ -1907,7 +1907,8 @@ module Test
             else
               @errors += 1
               bt = Test.filter_backtrace(e.backtrace).join "\n    "
-              "Error:\n#{klass}##{meth}:\n#{e.class}: #{e.message.b}\n    #{bt}\n"
+              err_class = ProxyError === e.class ? e.error_class : e.class.name
+              "Error:\n#{klass}##{meth}:\n#{err_class}: #{e.message.b}\n    #{bt}\n"
             end
         @report << e
         rep = e[0, 1] # S|F|T|E
@@ -1934,6 +1935,26 @@ module Test
 
       def print *a # :nodoc:
         output.print(*a)
+      end
+
+      def exit status
+        # stdout piped to file
+        if !$stdout.tty? && !worker_process?
+          $stdout.puts
+          $stdout.puts "Exited with status #{status}"
+        end
+        super
+      end
+
+      def abort msg
+        # stdout piped to file
+        if !$stdout.tty? && !worker_process?
+          $stdout.puts
+          # Don't want to output the message twice (for instance, if 2>&1)
+          $stdout.puts msg if $stderr.tty?
+          $stdout.puts "Exited with status 1"
+        end
+        super
       end
 
       ##

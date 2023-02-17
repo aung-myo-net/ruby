@@ -154,7 +154,7 @@ module Test
 
         begin
           @_passed = nil
-          @_interrupted = nil
+          interrupted = false
           self.before_setup
           self.setup
           self.after_setup
@@ -164,7 +164,7 @@ module Test
           runner.record self.class, @__name__, @_assertions, time, nil
           @_passed = true
         rescue *PASSTHROUGH_EXCEPTIONS => e
-          @_interrupted = e if e.is_a?(Interrupt)
+          interrupted = e if e.is_a?(Interrupt)
           raise
         rescue Exception => e
           @_passed = Test::Unit::PendedError === e
@@ -173,7 +173,7 @@ module Test
           result = runner.puke self.class, @__name__, e
         ensure
           # If we run the teardown hooks after an interrupt, we get lots of errors
-          unless @_interrupted
+          unless interrupted
             TEARDOWN_HOOKS.each do |hook|
               begin
                 self.send hook
