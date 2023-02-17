@@ -812,7 +812,8 @@ module Test
           unless @interrupt
             w = Marshal.load($1.unpack1("m"))
             unless @warnings.include?(w[1].message)
-              warn "#{w[0]}: #{w[1].message} (#{w[1].class})"
+              warn "#{w[0]}: #{w[1].message} (#{w[1].error_class})"
+              warn ""
               @warnings << w[1].message
             end
           end
@@ -2168,11 +2169,12 @@ module Test
     end
 
     class ProxyError < StandardError # :nodoc: all
-      attr_reader :message, :backtrace
+      attr_reader :message, :backtrace, :error_class
 
       def initialize(ex)
         @message = ex.message
         @backtrace = ex.backtrace
+        @error_class = ex.class.name
       end
     end
   end

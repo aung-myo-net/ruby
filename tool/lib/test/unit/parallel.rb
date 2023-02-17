@@ -75,11 +75,12 @@ module Test
 
         begin
           result = orig_run_suite(suite, type)
-        # Using a terminal, interrupt signal by ctrl-c is sent to all processes in
-        # foreground process group, so even child processes get the signal.
         rescue Interrupt
+          # Using a terminal, interrupt signal by ctrl-c is sent to all processes in
+          # foreground process group, so even child processes get the signal.
+          # Send "done" to parent with the results we collected so far.
           @need_exit = true
-          result = [nil,nil]
+          result = [@suite_test_count, @suite_assertion_count]
         end
 
         Test::Unit::Runner.output = orig_testout
