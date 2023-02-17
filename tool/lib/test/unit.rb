@@ -1992,7 +1992,7 @@ module Test
             puts
           end
           puts "Finished%s %ss in %.6fs, %.4f tests/s, %.4f assertions/s.\n" %
-              [(@repeat_count ? "(#{@@current_repeat_count}/#{@repeat_count}) " : ""), type,
+              [(@repeat_count ? " (#{@@current_repeat_count}/#{@repeat_count})" : ""), type,
                 t, @test_count.fdiv(t), @assertion_count.fdiv(t)]
         end while @repeat_count && @@current_repeat_count < @repeat_count &&
                   @report.empty? && @failures.zero? && @errors.zero?
