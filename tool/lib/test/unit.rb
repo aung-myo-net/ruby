@@ -242,6 +242,9 @@ module Test
       def setup_options(opts, options)
         opts.separator 'test-unit options:'
 
+        options[:report_after] = false
+        options[:verbose] = false
+
         opts.on '-h', '--help', 'Display this help.' do
           puts opts
           exit
@@ -256,13 +259,100 @@ module Test
           @verbose = options[:verbose]
         end
 
-        opts.on '-n', '--name PATTERN', "Filter test method names on pattern: /REGEXP/, !/REGEXP/ or STRING" do |a|
+        # NOTE: when filtering on !/REGEXP/ and using a shell like bash, you
+        # must escape ! with a backslash.
+        opts.on '-n', '--name PATTERN', "Filter TestClass#test_example on pattern: /REGEXP/, !/REGEXP/ or STRING" do |a|
           (options[:test_name_filter] ||= []) << a
         end
 
         orders = Test::Unit::Order::Types.keys
-        opts.on "--test-order=#{orders.join('|')}", orders do |a|
+        opts.on "--test-order=#{orders.join('|')}", "default=random" do |a|
           options[:test_order] = a
+        end
+
+        opts.on('--report-failures-after', "Report failures only after all tests have ran instead of immediately") do
+          options[:report_after] = true
+        end
+      end
+
+      class TestNameFilter # :nodoc: all
+        attr_reader :pat
+
+        def initialize(pat)
+          @pat = pat
+          @is_string_pat = true
+          if String === pat
+          elsif Regexp === pat
+            @is_string_pat = false
+          else
+            raise ArgumentError, "Expect String or Regexp"
+          end
+        end
+
+        def regexp!
+          raise "pat should be Regexp" if @is_string_pat
+          @pat
+        end
+
+        def regexp_string_to_regexp
+          raise unless regexp_string?
+          options = 0
+          options = Regexp::IGNORECASE if @opt_i
+          Regexp.new(regexp_string_match, options)
+        end
+
+        # Is this string like "/something/" or "!/something/"
+        def regexp_string?
+          return false unless @is_string_pat
+          @regexp_string ||= (pos_regexp_string? || neg_regexp_string?)
+        end
+
+        # Check that this is not a regexp string like "/something/", just a regular string
+        def check_plain_string!
+          raise unless plain_string?
+        end
+
+        # is this string like "/something/"
+        def pos_regexp_string?
+          return false unless @is_string_pat
+          @pos_pat ||= begin
+            res = ((/\A\/(.*)\/([i])?\z/ =~ @pat) ? true : false)
+            if res
+              @pat_match = $1
+              @opt_i = $2
+            end
+            res
+          end
+        end
+
+        # is this string like "!/something/"
+        def neg_regexp_string?
+          return false unless @is_string_pat
+          @neg_pat ||= begin
+            res = ((/\A!\/(.*)\/([i])?\z/ =~ @pat) ? true : false)
+            if res
+              @pat_match = $1
+              @opt_i = $2
+            end
+            res
+          end
+        end
+
+        # extract "something" from "/something/" or "!/something/
+        def regexp_string_match
+          raise unless regexp_string?
+          @pat_match
+        end
+
+        def fully_qualified_test_method_string?
+          return false unless plain_string?
+          @pat =~ /\A[A-Z]\w*(?:::[A-Z]\w*)*#/
+        end
+
+        private
+
+        def plain_string?
+          @is_string_pat && !regexp_string?
         end
       end
 
@@ -270,24 +360,43 @@ module Test
       def non_options(files, options)
         filter = options[:test_name_filter]
         if filter
-          pos_pat = /\A\/(.*)\/\z/
-          neg_pat = /\A!\/(.*)\/\z/
-          negative, positive = filter.partition {|s| neg_pat =~ s}
+          filter.map! { |pat| TestNameFilter.new(pat) }
+          negative, positive = filter.partition {|filt| filt.neg_regexp_string? }
           if positive.empty?
             filter = nil
-          elsif negative.empty? and positive.size == 1 and pos_pat !~ positive[0]
-            filter = positive[0]
-            unless /\A[A-Z]\w*(?:::[A-Z]\w*)*#/ =~ filter
-              filter = /##{Regexp.quote(filter)}\z/
-            end
           else
-            filter = Regexp.union(*positive.map! {|s| Regexp.new(s[pos_pat, 1] || "\\A#{Regexp.quote(s)}\\z")})
+            pos_rs = positive.map {|filt|
+              if filt.pos_regexp_string?
+                r = filt.regexp_string_to_regexp
+              end
+              # a plain string is given, it must match exactly with test name
+              if !r
+                filt.check_plain_string!
+                if filt.fully_qualified_test_method_string?
+                  pat_s = Regexp.quote(filt.pat)
+                  r = /\A#{pat_s}\z/
+                else
+                  r = /##{Regexp.quote(filt.pat)}\z/
+                end
+              end
+              r
+            }
+            filter = TestNameFilter.new(Regexp.union(*pos_rs))
           end
-          unless negative.empty?
-            negative = Regexp.union(*negative.map! {|s| Regexp.new(s[neg_pat, 1])})
-            filter = /\A(?=.*#{filter})(?!.*#{negative})/
+          if negative.any?
+            neg_rs = negative.map { |filt| filt.regexp_string_to_regexp }
+            neg_r = Regexp.union(*neg_rs)
+            if filter
+              filter_r = /\A(?=.*#{filter.regexp!})(?!.*#{neg_r})/
+            else
+              filter_r = /\A(?!.*#{neg_r})/
+            end
+            filter = TestNameFilter.new(filter_r)
           end
-          options[:test_name_filter] = filter
+          options[:test_name_filter] = filter.regexp!
+          if (debug = ENV.delete("DEBUG_TEST_NAME_FILTER")) && debug != '0'
+            $stderr.puts options[:test_name_filter]
+          end
         end
         true
       end
@@ -324,6 +433,7 @@ module Test
       def non_options(files, options)
         return super(files, options) if worker_process?
         makeflags = ENV.delete("MAKEFLAGS")
+        # TODO: document how to use this and what it's for
         if !options[:parallel] and
           /(?:\A|\s)--jobserver-(?:auth|fds)=(?:(\d+),(\d+)|fifo:((?:\\.|\S)+))/ =~ makeflags
           begin
@@ -361,7 +471,7 @@ module Test
         options[:retry_timeouts] = true
         options[:retry_failures] = true
 
-        opts.on '-j N', '--jobs N', /\A(t)?(\d+)\z/, "Allow run tests with N jobs at once" do |_, t, a|
+        opts.on '-j N', '--jobs N', /\A(t)?(\d+)\z/, "Allow run tests with N jobs (workers) at once" do |_, t, a|
           options[:testing_parallel] = true & t # For testing
           options[:parallel] = a.to_i
         end
@@ -370,39 +480,41 @@ module Test
           options[:worker_timeout] = a
         end
 
-        opts.on '--separate', "Restart job process after one testcase (file) has finished" do
+        opts.on '--separate', "Restart worker process after one testcase (file) has finished" do
           options[:parallel] ||= 1
           options[:separate_worker_per_suite] = true
         end
 
         # The default is retry suites (files) that timed out or had failures.
+        # The retry is done in the current process, not by worker processes.
         # Failures here means assertion failures OR uncaught exceptions (errors).
-        opts.on '--retry FOR', /all|timeouts?|failures?|none/, "Retry running testcase when --jobs specified" do |_for|
-          case _for
-          when /all/
+        opts.on '--retry=failures|timeouts|all|none', "Retry the files that timed out or failed" do |_retry|
+          case _retry
+          when 'all'
             options[:retry_timeouts] = true
             options[:retry_failures] = true
-          when /timeouts?/
+          when 'timeouts'
             options[:retry_timeouts] = true
             options[:retry_failures] = false
-          when /failures?/
+          when 'failures'
             options[:retry_timeouts] = false
             options[:retry_failures] = true
-          when /none/
+          when 'none'
             options[:retry_timeouts] = false
             options[:retry_failures] = false
           end
         end
 
-        opts.on '--no-retry', "Disable --retry" do
+        opts.on '--no-retry', "Don't retry files with failures or timeouts. Same as --retry=none" do
           options[:retry_timeouts] = false
           options[:retry_failures] = false
         end
 
-        opts.on '--ruby VAL', "Path to ruby which is used at -j option" do |a|
+        opts.on '--ruby VAL', "Path to ruby which is used for workers" do |a|
           options[:ruby] = a.split(/ /).reject(&:empty?)
         end
 
+        # TODO: document what this is for
         opts.on '--timetable-data=FILE', "Path to timetable data" do |a|
           options[:timetable_data] = a
         end
@@ -419,6 +531,7 @@ module Test
       # Set $VERBOSE or $DEBUG manually when debugging
       def debug
         if $VERBOSE || $DEBUG
+          del_status_line
           $stderr.puts yield
         end
       end
@@ -440,7 +553,7 @@ module Test
           Thread.current.report_on_exception = old_report_on_exception
         end
 
-        attr_reader :num, :io, :pid, :real_file, :quit_called, :response_at
+        attr_reader :num, :io, :pid, :real_file, :quit_called, :response_at, :error
         attr_accessor :start_time, :current, :status
         attr_accessor :suite_test_count, :suite_assertion_count, :suite_errors, :suite_failures,
                       :suite_skips
@@ -451,7 +564,7 @@ module Test
           @num = (@@worker_number += 1)
           @io = io # stdout/stderr from the worker process
           @pid = pid
-          @status = status # one of :prepare, :ready, :running, :quit, :exited, :killed
+          @status = status # one of :prepare, :ready, :running, :awaiting_quit_response, :exited, :killed
           @file = nil # current file name being run (base name)
           @real_file = nil # current file name being run (full path)
           @loadpath = []
@@ -468,6 +581,7 @@ module Test
           # These numbers are a best-effort attempt, because the output of the worker
           # is parsed to get them. The real data is sent when the suite is finished.
           @suite_errors = @suite_failures = @suite_skips = 0
+          @error = nil # Exception in communication with worker process
         end
 
         def name
@@ -500,9 +614,11 @@ module Test
             @status = :prepare
             @start_time = Time.now
             @response_at = @start_time
-          rescue Errno::EPIPE
+          rescue Errno::EPIPE => e
+            @error = e
             died
-          rescue IOError
+          rescue IOError => e
+            @error = e
             raise unless /stream closed|closed stream/ =~ $!.message
             died
           end
@@ -515,7 +631,7 @@ module Test
         end
 
         def read
-          res = (@status == :quit) ? @io.read : @io.gets
+          res = (@status == :awaiting_quit_response) ? @io.read : @io.gets
           @response_at = Time.now
           res && res.chomp
         end
@@ -533,15 +649,16 @@ module Test
         def quit(warn_if_closed: true)
           if @io.closed?
             @quit_called = true
-            @status = :quit
+            @status = :awaiting_quit_response if @status == :running
             return
           end
           return if @quit_called
           @quit_called = true
           old_status = @status
-          @status = :quit
+          @status = :awaiting_quit_response
           @io.puts "quit"
         rescue Errno::EPIPE => e
+          @error = e
           if warn_if_closed
             warn "Tried to send 'quit' to #{@pid}:#{old_status.to_s.ljust(7)}:#{@file}: #{e.message}"
           end
@@ -555,7 +672,7 @@ module Test
 
         # Worker process can no longer be communicated with (may have exited)
         def died(*additional)
-          @status = :quit
+          @status = :exited
           @io.close
           status = $?
           if status and status.signaled?
@@ -593,7 +710,7 @@ module Test
       end
 
       def after_worker_down(worker, e=nil, c=false)
-        return unless @options[:parallel]
+        worker.status = :exited
         return if @interrupt
         del_status_line
         flush_job_tokens
@@ -625,8 +742,8 @@ module Test
         exit c
       end
 
-      def after_worker_quit(worker)
-        return unless @options[:parallel]
+      def after_worker_exit(worker)
+        worker.status = :exited
         return if @interrupt
         worker.close
         if @jobserver and (token = @job_tokens.slice!(0))
@@ -634,6 +751,7 @@ module Test
         end
         delete_worker(worker)
         @dead_workers << worker
+        jobs_status(worker: nil)
       end
 
       def launch_worker
@@ -643,7 +761,7 @@ module Test
           abort "ERROR: Failed to launch job process - #{e.class}: #{e.message}"
         end
         worker.hook(:dead) do |w,info|
-          after_worker_quit w
+          after_worker_exit w
           after_worker_down w, *info if !info.empty? && !worker.quit_called
         end
         @workers << worker
@@ -653,9 +771,9 @@ module Test
       end
 
       def delete_worker(worker)
-        @workers_hash.delete worker.io
         @workers.delete worker
         @ios.delete worker.io
+        @workers_hash.delete worker.io
       end
 
       # Stop the worker processes. If `cond` is given, only
@@ -665,9 +783,10 @@ module Test
       # be running.
       def quit_workers(reason: nil, timeout: nil, &cond)
         return @workers if @workers.empty?
+        #$VERBOSE = 1 # debugging
         quit_workers = []
         killed_workers = []
-        @workers.reject! do |worker|
+        @workers.each do |worker|
           if cond
             next unless cond.call(worker)
             if reason == :timeout
@@ -691,12 +810,14 @@ module Test
             debug { "Killing worker #{worker.pid} after close timeout expired" }
             worker.kill
             killed_workers << worker
+            jobs_status(except: killed_workers)
             retry
           end
           quit_workers << worker
-          @ios.delete worker.io
-          @workers_hash.delete worker.io
-          true
+        end
+
+        killed_workers.each do |w|
+          delete_worker(w)
         end
 
         if quit_workers.empty?
@@ -706,26 +827,26 @@ module Test
         return quit_workers if killing.empty? # already killed above
 
         pids = killing.map(&:pid)
-        exited_pids = []
-        begin
-          # Wait for suites to finish after call to `quit`. If they've been sent an interrupt signal they will
-          # finish immediately.
-          Timeout.timeout(0.2 * pids.size) do
-            pids.each { |pid|
+        pids.each { |pid|
+          begin
+            t = 0.2
+            # Wait for suites to finish after call to `quit`. If they've been sent an interrupt signal they will
+            # finish immediately.
+            Timeout.timeout(t) do
               begin
                 Process.waitpid(pid)
               rescue Errno::ECHILD
               end
-              exited_pids << pid
-            }
+            end
+          rescue Timeout::Error
+            debug { "Killing (sig 9) worker process #{pid} after waitpid timeout expired (#{t}s)" }
+            Process.kill(:KILL, pid) rescue nil
           end
-        rescue Timeout::Error
-          if pids
-            debug { "Killing (sig 9) worker processes #{(pids-exited_pids).map(&:to_s).join(',')} after waitpid timeout expired" }
-            Process.kill(:KILL, *(pids-exited_pids)) rescue nil
-          end
+        }
+        killing.each do |w|
+          w.status = :killed
+          delete_worker(w)
         end
-        killing.each { |w| w.status = :killed }
         quit_workers
       end
 
@@ -734,7 +855,7 @@ module Test
         (@fake_classes ||= {})[name] ||= FakeClass.new(name)
       end
 
-      # Deal with worker events, return `nil` on worker quit, `true` if suite results have
+      # Deal with worker events. Return `nil` when no more events for the io, `true` if suite results have
       # been collected or they cannot be collected (due to error), and `false` otherwise.
       def deal(io, type, result, rep, shutting_down = false)
         worker = @workers_hash[io]
@@ -751,7 +872,7 @@ module Test
           worker.status = :ready
 
           unless task = @tasks.shift
-            worker.quit
+            worker.quit # don't remove from @workers, let it go through "bye" procedure
             return nil
           end
           if @options[:separate_worker_per_suite] and not bang
@@ -761,7 +882,7 @@ module Test
           worker.run(task, type)
           @test_count += 1
 
-          jobs_status(worker)
+          jobs_status(worker: worker)
         when /^_R_: start (.+?)$/ # start of method, set current test case of worker
           ary = Marshal.load($1.unpack1("m"))
           worker.current = ary.first(2)
@@ -778,7 +899,7 @@ module Test
           result << r[0..1] unless r[0..1] == [nil,nil]
           rep    << {file: worker.real_file, report: r[2], result: r[3], testcase: r[5]}
           $:.push(*r[4]).uniq!
-          jobs_status(worker) if @options[:job_status] == :replace
+          jobs_status(worker: worker) if @options[:job_status] == :replace
           return true
         when /^_R_: record (.+?)$/ # recorded hook
           raise "records shouldn't be on" unless recording?
@@ -803,8 +924,8 @@ module Test
             ef_match = $1
             msg = match[1..-1]
             msg = msg.unpack1("m")
-            @report << msg unless @interrupt
             unless @interrupt
+              @report << msg
               del_status_line
               efs_change = print(ef_match) # print the error or failure
               if efs_change != [0,0,0]
@@ -812,18 +933,20 @@ module Test
                 worker.suite_failures += efs_change[1]
                 worker.suite_skips += efs_change[2]
               end
+              jobs_status(worker: worker) if @options[:job_status] == :replace
             end
-            jobs_status(worker) if @options[:job_status] == :replace
           else
-            del_status_line
-            status_msg = match.unpack1("m")
-            efs_change = print status_msg # '.' or 'S' or long result if verbose mode
-            if efs_change != [0,0,0]
-              worker.suite_errors += efs_change[0]
-              worker.suite_failures += efs_change[1]
-              worker.suite_skips += efs_change[2]
+            unless @interrupt
+              del_status_line
+              status_msg = match.unpack1("m")
+              efs_change = print status_msg # '.' or 'S' or long result if verbose mode
+              if efs_change != [0,0,0]
+                worker.suite_errors += efs_change[0]
+                worker.suite_failures += efs_change[1]
+                worker.suite_skips += efs_change[2]
+              end
+              jobs_status(worker: worker) if @options[:job_status] == :replace
             end
-            jobs_status(worker) if @options[:job_status] == :replace
           end
         when /^_R_: after (.+?)$/ # couldn't load test file
           unless @interrupt
@@ -837,15 +960,13 @@ module Test
           end
         when /^_R_: bye (.+?)$/ # exception in worker
           unless @interrupt
-            worker.status = :exited
             error_msg = Marshal.load($1.unpack1("m"))
             after_worker_down worker, error_msg
           end
           return true
         when /^_R_: bye$/, nil
-          worker.status = :exited
           if shutting_down || worker.quit_called
-            after_worker_quit worker
+            after_worker_exit worker
           else
             after_worker_down worker
           end
@@ -854,7 +975,7 @@ module Test
           # probably a warning in a sub-process. $stderr of worker processes gets here
           # Also if worker outputs directly to $stdout instead of going through the runner's output
           # it ends up here.
-          unless @options[:silence_worker_output]
+          if !@options[:silence_worker_output] && !@interrupt
             del_status_line
             $stdout.puts "#{cmd}"
             $stdout.flush
@@ -890,7 +1011,7 @@ module Test
         begin
           while true
             worker_size = [@tasks.size, @options[:parallel]].min
-            if worker_size > @workers.size
+            if @workers.size < worker_size
               (worker_size-@workers.size).times { launch_worker }
             end
             # Get the minimum timeout needed based on the oldest Worker#response_at
@@ -942,15 +1063,22 @@ module Test
           end
 
           if @interrupt
-            # Get "bye" message from interrupted workers with their partial results
-            @ios.select!{|x| @workers_hash[x].status == :running }
-            while @ios.any? && (__io = IO.select(@ios,[],[],10))
-              _io = __io[0][0]
-              @ios.reject! {|io|
-                next unless _io.fileno == io.fileno
-                res = deal(io, type, result, rep, true)
-                res.nil? || res
-              }
+            # Get "done" message from interrupted workers with their partial results
+            @ios.select! do |x|
+              [:running, :awaiting_quit_response].include?(@workers_hash[x].status)
+            end
+            begin
+              Timeout.timeout(3) do
+                while @ios.any? && (__io = IO.select(@ios,[],[],3))
+                  _io = __io[0][0]
+                  @ios.reject! {|io|
+                    next unless _io.fileno == io.fileno
+                    res = deal(io, type, result, rep, true)
+                    res.nil? || res
+                  }
+                end
+              end
+            rescue Timeout::Error
             end
           end
 
@@ -962,6 +1090,11 @@ module Test
           if @interrupt
             parallel_report(result, rep, time_taken, type)
             abort "Interrupted"
+          end
+
+          if @options[:report_after] && @report.size > 0
+            $stdout.puts
+            output_error_messages
           end
 
           orig_rep = rep
@@ -1007,7 +1140,7 @@ module Test
               _run_suites(failed_suites, type)
             end
           end
-          # Retry suites that failed in this process
+          # Retry suites that timed out in this process
           if @options[:retry_timeouts]
             if timed_out_suites.any?
               puts "\n""Retrying hung up testcases..."
@@ -1040,8 +1173,8 @@ module Test
             @options[:parallel] = old_parallel
           end
 
-          if @repeat_count.to_i > 1 || (!@options[:retry_failures])
-            del_status_line or puts
+          if @repeat_count.to_i > 1 || !@options[:retry_failures]
+            del_status_line
             orig_rep.each do |x|
               (e, f, s = x[:result]) or next
               @errors   += e
@@ -1140,7 +1273,7 @@ module Test
             update_list(stats[:most_asserted], rec, max) {|_,_,a,_,_|a<assertions}
           end
         end
-        # (((@record ||= {})[suite] ||= {})[method]) = [assertions, time, error]
+         #(((@record ||= {})[suite] ||= {})[method]) = [assertions, time, error]
         super
       end
 
@@ -1250,6 +1383,14 @@ module Test
 
       def failed(s)
         raise if worker_process?
+        return if @options[:report_after]
+        output_error_messages
+        @report.clear
+      end
+
+      private
+
+      def output_error_messages
         sep = "\n"
         @report.each do |msg|
           if msg.start_with? "Skipped:"
@@ -1261,15 +1402,17 @@ module Test
           else
             color = "fail"
           end
-          first, msg = msg.split(/$/, 2)
-          first = sprintf("%3d) %s", @report_count += 1, first)
+          first, msg = fmt_error_message(msg)
           @failed_output.print(sep, @colorize.decorate(first, color), msg, "\n")
           sep = nil
         end
-        @report.clear
       end
 
-      private
+      def fmt_error_message(msg)
+        first, msg = msg.split(/$/, 2)
+        first = sprintf("%3d) %s", @report_count += 1, first)
+        [first, msg]
+      end
 
       def use_tty?
         if @force_tty != nil
@@ -1291,7 +1434,7 @@ module Test
         @terminal_width
       end
 
-      def del_status_line(flush = true)
+      def del_status_line(flush: true)
         if @options[:job_status] == :replace
           $stdout.print "\r"+" "*@status_line_size+"\r"
         else
@@ -1305,11 +1448,14 @@ module Test
         @status_line_size = 0
       end
 
-      def jobs_status(worker)
+      def jobs_status(worker: nil, except: nil)
         return if @options[:job_status] == :none
         if @options[:job_status] == :replace
           status_line = @workers.map(&:to_s).join(" ")
+        elsif except
+          status_line = (@workers-Array(except)).map(&:to_s).join(" ")
         else
+          raise ArgumentError, "needs worker" unless worker
           status_line = worker.to_s
         end
         update_status(status_line) or (puts; nil)
@@ -1344,7 +1490,7 @@ module Test
       def update_status(s)
         return if @options[:job_status] == :none
         count = @test_count.to_s(10).rjust(@total_tests.size)
-        del_status_line(false)
+        del_status_line(flush: false)
         add_status(@colorize.pass("[#{count}/#{@total_tests}]"))
         add_status(" #{s}")
         $stdout.print "\r" if @options[:job_status] == :replace and !@verbose
@@ -1357,7 +1503,7 @@ module Test
         opts.separator "status line options:"
 
         # if tty, default is :replace
-        # otherwise, default is :none
+        # otherwise, default is :normal
         options[:job_status] = nil
         options[:color] = :auto
 
@@ -1371,7 +1517,7 @@ module Test
 
         opts.on '--color[=WHEN]',
                 [:always, :never, :auto],
-                "colorize the output.  WHEN defaults to 'auto'", "or can be 'never' or 'auto'." do |c|
+                "colorize the output.  WHEN defaults to 'auto'", "or can be 'never' or 'always'." do |c|
           options[:color] = c
         end
 
@@ -1737,7 +1883,9 @@ module Test
         end
         options[:excludes] = excludes || []
         parser.separator "excludes options:"
-        parser.on '-X', '--excludes-dir DIRECTORY', "Directory name of exclude files" do |d|
+        # This does not exclude directories from being run, it's a directory
+        # that has special files that exclude tests from certain test classes.
+        parser.on '-X', '--excludes-dir DIRECTORY', "Directory name of special exclude files" do |d|
           options[:excludes].concat d.split(File::PATH_SEPARATOR)
         end
       end
@@ -1939,7 +2087,7 @@ module Test
 
         self.class.plugins.each do |plugin|
           send plugin
-          break unless @report.empty?
+          break if @report.any?
         end
 
         return @failures + @errors if @test_count > 0 # or return nil
@@ -2057,9 +2205,7 @@ module Test
 
         output.sync = old_sync if sync
 
-        @report.each_with_index do |msg, i|
-          puts "\n%3d) %s" % [i + 1, msg]
-        end
+        output_error_messages
 
         puts
         @test_count      = test_count

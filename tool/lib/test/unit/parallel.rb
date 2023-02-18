@@ -10,7 +10,7 @@ require_relative '../../gc_checker'
 
 module Test
   module Unit
-    # Worker sub-process
+    # Worker sub-process for parallel (-j) option
     class Worker < Runner # :nodoc:
       class << self
         undef autorun
