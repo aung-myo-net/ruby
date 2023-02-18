@@ -197,6 +197,7 @@ module Test
         @verbose = false
         @default_dir = nil
         @option_parser = OptionParser.new
+        @option_warnings = []
         super(&nil)
       end
 
@@ -1607,8 +1608,12 @@ module Test
           dir = File.expand_path(dir) unless File.absolute_path?(dir)
           (options[:base_directories] ||= []) << dir
         end
-        # example: -x /test_hash/
-        parser.on '-x', '--exclude REGEXP', 'Exclude test files on pattern.' do |pattern|
+        # example: -x test_hash
+        parser.on '-x', '--exclude PATTERN', 'Exclude test files on basic pattern. Ex: -x test_gc' do |pattern|
+          # NOTE: -x /test_hash/ does not work. This is not same format as --name option.
+          if /\A\// =~ pattern && (!File.exist?(pattern) || pattern == '//')
+            @option_warnings << "Warning: -x pattern should be a basic string pattern, / will be treated as part of file path"
+          end
           (options[:exclude_file_patterns] ||= []) << pattern
         end
       end
@@ -2080,6 +2085,9 @@ module Test
         @options.merge! args
 
         puts "Run options:#{@help}"
+        if @option_warnings.any?
+          @option_warnings.each { |w| $stderr.puts "\n", w }
+        end
         if req = @options.delete(:requirer)
           puts "\n# Loading test files"
           req.call
