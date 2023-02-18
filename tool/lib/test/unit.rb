@@ -1603,7 +1603,7 @@ module Test
       def setup_options(parser, options)
         super
         parser.separator "globbing options:"
-        parser.on '-B', '--base-directory DIR', 'Base directory to glob.' do |dir|
+        parser.on '-B', '--base-directory DIR', 'Base directory to glob' do |dir|
           raise OptionParser::InvalidArgument, "not a directory: #{dir}" unless File.directory?(dir)
           dir = File.expand_path(dir) unless File.absolute_path?(dir)
           (options[:base_directories] ||= []) << dir
@@ -1612,7 +1612,7 @@ module Test
         parser.on '-x', '--exclude PATTERN', 'Exclude test files on basic pattern. Ex: -x test_gc' do |pattern|
           # NOTE: -x /test_hash/ does not work. This is not same format as --name option.
           if /\A\// =~ pattern && (!File.exist?(pattern) || pattern == '//')
-            @option_warnings << "Warning: -x pattern should be a basic string pattern, / will be treated as part of file path"
+            @option_warnings << "Warning: -x pattern should be a basic string pattern, / is treated as part of file path"
           end
           (options[:exclude_file_patterns] ||= []) << pattern
         end
@@ -1642,52 +1642,43 @@ module Test
         end
         custom_basedirs = options[:base_directories] if options[:base_directories] != [DEFAULT_TEST_DIR]
         if custom_basedirs && files == [DEFAULT_TEST_DIR]
+          # custom basedirs given, no files given
           files.replace custom_basedirs.dup
         elsif custom_basedirs && files != [DEFAULT_TEST_DIR]
+          # files and custom basedirs given
           files.concat custom_basedirs
           files.uniq!
         end
-        #STDERR.print "files: ", files, "\n"
-        files.map! {|f|
+        files.map! do |f|
           f = f.tr(File::ALT_SEPARATOR, File::SEPARATOR) if File::ALT_SEPARATOR
           orig_f = f
           while true
-            #STDERR.print 'f: ', f.inspect, "\n"
             ret = paths.any? do |prefix|
-              #STDERR.print 'prefix: ', prefix.inspect, "\n"
-              #STDERR.print 'paths: ', paths.inspect, "\n"
               abs_file_no_prefix = false
               if prefix
                 if File.absolute_path?(f)
                   path = f
                   abs_file_no_prefix = true
                 else
-                  path = if f.empty?
-                           prefix
-                         else
-                           path_made = "#{prefix}/#{f}"
-                           if File.exist?(File.expand_path(path_made))
-                             path_made
-                           elsif File.exist?(File.expand_path(f))
-                             abs_file_no_prefix = true
-                             File.expand_path(f) # file exists outside base directory
-                           else
-                             next
-                           end
-                         end
-                  #STDERR.print 'made path: ', path, "\n"
+                  # relative path
+                  path =
+                    if f.empty?
+                      prefix
+                    else
+                      path_made = "#{prefix}/#{f}"
+                      if File.exist?(File.expand_path(path_made))
+                        path_made
+                      else
+                        next
+                      end
+                    end
                 end
               else
                 next if f.empty?
                 path = f
               end
-              #STDERR.print "paths: ", paths.inspect, "\n"
-              #STDERR.print "prefix: ", prefix.inspect, "\n"
-              #STDERR.print "f: ", f.inspect, "\n"
-              #STDERR.print "path: ", path.inspect, "\n"
 
               path_is_dir = Dir.exist?(path)
-
               dir = path_is_dir ? path : nil
               if dir
                 match = (Dir["#{dir}/**/#{@@testfile_prefix}_*.rb"] + Dir["#{dir}/**/*_#{@@testfile_suffix}.rb"]).uniq
@@ -1695,33 +1686,38 @@ module Test
                 match = Dir[path]
               end
 
-              if !match.empty?
+              if match.any?
                 if exclude_pats
                   match.reject! {|n|
-                    n = if abs_file_no_prefix
+                    without_prefix = if abs_file_no_prefix
                       n
                     else
                       n[(prefix.length+1)..-1] if prefix
                     end
-                    exclude_re =~ n
+                    exclude_re =~ without_prefix
                   }
                 end
                 break match
               elsif !exclude_pats or (exclude_re !~ f and File.exist?(path))
+                if !File.exist?(path)
+                  next
+                end
                 break path
+              else
+                # no matches or file is excluded
+                false
               end
-            end
+            end # paths.any?
 
             if !ret
               f = complement_test_name(f, orig_f)
             else
               break ret
             end
-          end
-        }
+          end # while
+        end
         files.flatten!
         files.uniq!
-        #STDERR.puts "new files: #{files.size}"
         super(files, options)
       end
     end
@@ -2387,6 +2383,7 @@ module Test
 
       def run
         if @force_standalone and not process_args(@argv)
+          $stderr.puts "No test files to run"
           abort @options.banner
         end
         @runner.run(@argv) || true
