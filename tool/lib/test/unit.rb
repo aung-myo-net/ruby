@@ -547,7 +547,7 @@ module Test
 
         attr_reader :num, :io, :pid, :real_file, :quit_called, :response_at, :error
         attr_accessor :start_time, :current, :status
-        attr_accessor :suite_test_count, :suite_assertion_count, :suite_errors, :suite_failures,
+        attr_accessor :suite_test_total, :suite_test_count, :suite_assertion_count, :suite_errors, :suite_failures,
                       :suite_skips
 
         @@worker_number = 0
@@ -568,7 +568,8 @@ module Test
           # Normally suite results are sent by a worker process when it's
           # finished the suite, but if the worker times out we want access to
           # this information, so we keep track of it here:
-          @suite_test_count = 0 # number of tests run so far in current suite
+          @suite_test_count = 0 # number of tests run so far in current file
+          @suite_test_total = 0 # number of total tests for current file
           @suite_assertion_count = 0 # number of assertions made so far in current suite
           # These numbers are a best-effort attempt, because the output of the worker
           # is parsed to get them. The real data is sent when the suite is finished.
@@ -594,7 +595,7 @@ module Test
 
         # Communicates with worker process to run a test file
         def run(task,type)
-          @suite_test_count = @suite_assertion_count = 0
+          @suite_test_total = @suite_test_count = @suite_assertion_count = 0
           @suite_errors = @suite_failures = @suite_skips = 0
           @file = File.basename(task, ".rb")
           dir = File.dirname(task)
@@ -872,9 +873,7 @@ module Test
             worker = launch_worker
           end
           worker.run(task, type)
-          unless @options[:job_status] == :replace
-            @test_count += 1
-          end
+          @test_count += 1
 
           jobs_status(worker: worker)
         when /^_R_: start (.+?)$/ # start of method, set current test case of worker
@@ -884,9 +883,7 @@ module Test
           worker.suite_assertion_count += last_test_assertions
           worker.suite_test_count += 1
         when /^_R_: running file ([0-9]+)$/
-          if @options[:job_status] != :replace
-            @total_tests = $1
-          end
+          worker.suite_test_total = $1.to_i
         when /^_R_: done (.+?)$/ # done running suite, collect results
           begin
             r = Marshal.load($1.unpack1("m"))
@@ -921,11 +918,9 @@ module Test
           if ((!@verbose) && match =~ /\A([EFS]) (.+)\z/) ||
               (@verbose && match =~ /\A(.+? s = ([EFS])) \|\| (.+?)\z/) # error or failure in non-verbose mode
             if @verbose
-              ef_match = $2
               msg = $1 + "\n"
               err = $3.unpack1("m")
             else
-              ef_match = $1
               msg = $1
               err = $2.unpack1("m")
             end
@@ -933,7 +928,7 @@ module Test
               @report << err
               del_status_line
               if @verbose
-                efs_change = print_verbose(msg) # print the error or failure
+                efs_change = print_verbose(msg, test_count: worker.suite_test_count, total_tests: worker.suite_test_total) # print the error or failure
               else
                 efs_change = print(msg) # print the error or failure
               end
@@ -949,7 +944,7 @@ module Test
               del_status_line
               status_msg = match.unpack1("m")
               if @verbose
-                efs_change = print_verbose status_msg # long msg
+                efs_change = print_verbose(status_msg, test_count: worker.suite_test_count, total_tests: worker.suite_test_total) # long msg
               else
                 efs_change = print status_msg # '.' or 'S' or long result if verbose mode
               end
@@ -1370,13 +1365,15 @@ module Test
         @output || super
       end
 
-      def new_test(s)
+      def new_test(s, test_count: nil, total_tests: nil)
         raise if worker_process?
-        @test_count += 1
+        unless @options[:parallel]
+          @test_count += 1
+        end
         if @options[:job_status] == :none
           $stdout.print s
         else
-          update_status(s)
+          update_status(s, test_count: test_count, total_tests: total_tests)
         end
       end
 
@@ -1483,11 +1480,7 @@ module Test
       def _prepare_run_suites(suites, type)
         raise if worker_process?
         @options[:job_status] ||= :replace if use_tty? && !@verbose
-        if @verbose && @options[:parallel]
-          @options[:job_status] ||= (use_tty? ? :replace : :none)
-        else
-          @options[:job_status] ||= :normal
-        end
+        @options[:job_status] ||= :normal
         case @options[:color]
         when :always
           color = true
@@ -1509,11 +1502,13 @@ module Test
         @report.clear
       end
 
-      def update_status(s)
+      def update_status(s, test_count: nil, total_tests: nil)
         return if @options[:job_status] == :none
-        count = @test_count.to_s(10).rjust(@total_tests.size)
+        total_tests = total_tests || @total_tests.to_i
+        test_count = test_count || @test_count
+        count = test_count.to_s(10).rjust(total_tests.to_s.size)
         del_status_line(flush: false)
-        add_status(@colorize.pass("[#{count}/#{@total_tests}]"))
+        add_status(@colorize.pass("[#{count}/#{total_tests}]"))
         add_status(" #{s}")
         $stdout.print "\r" if @options[:job_status] == :replace and !@verbose
         $stdout.flush
@@ -1578,18 +1573,18 @@ module Test
             # Warnings, etc.
             $stdout.print(s)
           end
-          return NO_REPORT_CHANGE
+          NO_REPORT_CHANGE
         end
 
-        def print_verbose(s)
+        def print_verbose(s, test_count: nil, total_tests: nil)
           case s
           # Ex: "MyTest#test_something = 0.50 s = ."
           when /\A(.+?) (= [0-9.]+ s) = ([EFS.])/
             efsp = $3
             match = $1
             time = $2
-            test = match =~ /(.+#.+)/
-            runner.new_test($1)
+            _test = match =~ /(.+#.+)/
+            runner.new_test($1, test_count: test_count, total_tests: total_tests)
             runner.add_status(time)
             if efsp == '.'
               runner.succeed
@@ -1598,7 +1593,8 @@ module Test
               [efsp.count('F'), efsp.count('E'), efsp.count('S')]
             end
           else
-            raise ArgumentError, "msg #{s.inspect} doesn't match in print_verbose"
+            $stdout.print(s)
+            NO_REPORT_CHANGE
           end
         end
       end
@@ -2188,8 +2184,8 @@ module Test
         output.print(*a)
       end
 
-      def print_verbose *a # :nodoc:
-        output.print_verbose *a
+      def print_verbose *a, **kw # :nodoc:
+        output.print_verbose(*a, **kw)
       end
 
       private
