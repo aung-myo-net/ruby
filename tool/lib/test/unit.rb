@@ -262,6 +262,10 @@ module Test
           options[:test_order] = a
         end
 
+        opts.on('--without-leakchecker', "Turn off leakchecker") do
+          options[:without_leakchecker] = true
+        end
+
         opts.on('--report-failures-after', "Report failures only after all tests have ran instead of immediately") do
           options[:report_after] = true
         end
@@ -511,7 +515,7 @@ module Test
           options[:timetable_data] = a
         end
 
-        opts.on('--silence-worker-output', "Silence worker output such as warnings or leakchecker") do
+        opts.on('--silence-worker-output', "Silence worker $stderr, $stdout and leakchecker") do
           options[:silence_worker_output] = true
         end
       end
@@ -531,9 +535,9 @@ module Test
       class Worker # :nodoc: all
         def self.launch(ruby,args=[])
           old_report_on_exception = Thread.current.report_on_exception
-          # IO.popen spawns a new thread that will inherit this value, because
-          # we don't want it to output any errors, which usually happens
-          # during interrupts (ctrl-c)
+          # IO.popen spawns a new thread that will inherit this value. Because
+          # we don't want it to output any errors (which usually happens
+          # during INT signal), we set this value.
           Thread.current.report_on_exception = false
           scale = EnvUtil.timeout_scale
           io = IO.popen([*ruby, "-W1",
@@ -731,6 +735,7 @@ module Test
           p cmd # debugging why it's not working
           system(*cmd)
         end
+        quit_workers
         STDERR.flush
         exit c
       end
@@ -1203,6 +1208,7 @@ module Test
           suites.each {|suite|
             begin
               result << _run_suite(suite, type)
+              gc_suite(suite, type) if can_gc_suite?(suite, type)
             rescue Interrupt => e
               result << [@suite_test_count, @suite_assertion_count]
               @interrupt = e
@@ -2285,7 +2291,16 @@ module Test
         end
         all_test_methods = @order.sort_by_name(all_test_methods)
 
-        leakchecker = LeakChecker.new(output: self.class.output, use_buffered_output: worker_process?)
+        use_leakchecker = true
+        if defined?(RubyVM::MJIT) && RubyVM::MJIT.enabled? # compiler process is wrongly considered as leak
+          use_leakchecker = false
+        elsif @options[:without_leakchecker] || (worker_process? && @options[:silence_worker_output])
+          use_leakchecker = false
+        end
+
+        unless use_leakchecker
+          leakchecker = LeakChecker.new(output: self.class.output, use_buffered_output: worker_process?)
+        end
         if ENV["LEAK_CHECKER_TRACE_OBJECT_ALLOCATION"]
           require "objspace"
           trace = true
@@ -2314,10 +2329,8 @@ module Test
           puts if @verbose
           self.output.flush
 
-          unless defined?(RubyVM::MJIT) && RubyVM::MJIT.enabled? # compiler process is wrongly considered as leak
-            unless worker_process? && @options[:silence_worker_output]
-              leakchecker.check("#{inst.class}\##{inst.__name__}")
-            end
+          unless use_leakchecker
+            leakchecker.check("#{inst.class}\##{inst.__name__}")
           end
 
           _end_method(inst)
