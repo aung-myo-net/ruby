@@ -59,7 +59,7 @@ module Test
               outbuf = buf
               # We want outbuf to be 1 character so that if it's 'E' or 'F',
               # we send the error message with it. See `_report`
-              if outbuf =~ /\A[EF]/ && !@verbose && buf.size > 1 && @report.size > 0
+              if !@verbose && outbuf =~ /\A[EFS]/ && buf.size > 1 && @report.size > 0
                 readbuf.concat buf[1..-1].chars
                 outbuf = buf[0]
               end
@@ -116,9 +116,14 @@ module Test
       # received by the parent process. We need to be able to distinguish these
       # other messages from worker reports.
       def _report(res, *args) # :nodoc:
-        if res == "p" && args[0] && args[0] =~ /\A[EF]\z/ && @report.size > 0
+        if !@verbose && res == "p" && args[0] && args[0] =~ /\A[EFS]\z/ && @report.size > 0
           args << @report.shift # the error message
           @stdout.write("_R_: #{res} #{args[0]} #{args[1..-1].pack("m0")}\n")
+          return true
+        elsif @verbose && res == "p" && args[0] && args[0] =~ /\A.+ s = [EFS]$/ && @report.size > 0
+          args << @report.shift # the error message
+          msg = args[0][0...-1] # take off "\n"
+          @stdout.write("_R_: #{res} #{msg} || #{args[1..-1].pack("m0")}\n")
           return true
         end
         @stdout.write(args.empty? ? "_R_: #{res}\n" : "_R_: #{res} #{args.pack("m0")}\n")
@@ -136,7 +141,6 @@ module Test
         @@stop_auto_run = true
         @opts = @options.dup
         @need_exit = false
-        $LOAD_PATH.unshift(DEFAULT_TEST_DIR) unless $:.include?(DEFAULT_TEST_DIR)
 
         @old_loadpath = []
         begin
@@ -166,13 +170,23 @@ module Test
               begin
                 require File.realpath(suite_file)
               rescue LoadError => e
-                _report "after", Marshal.dump([suite_file, ProxyError.new(e)])
+                _report "after", Marshal.dump([suite_file, ProxyError.new(e, "#{suite_file}: #{e.message}")])
                 _report "ready"
                 next
               end
               # NOTE: this array can be empty if the file defined no class, like if there
               # is a guard around the definition of the class that was not met
               this_suite_ary = Test::Unit::TestCase.test_suites - old_suites
+
+              test_methods_size = 0
+              filter = @options[:test_name_filter] || // # match anything
+              this_suite_ary.each do |suite|
+                test_names = suite.send("#{suite_type}_methods")
+                test_methods_size += test_names.map { |test| "#{suite}##{test}" }.grep(filter).size
+              end
+
+              _report "running file #{test_methods_size.to_s(10)}"
+
               _run_suites this_suite_ary, suite_type.to_sym
 
               if @need_exit

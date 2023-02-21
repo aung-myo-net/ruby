@@ -62,9 +62,6 @@ module Test
   ##
   # Test::Unit is an implementation of the xUnit testing framework for Ruby.
   module Unit
-    DEFAULT_TEST_DIR = File.expand_path(__dir__ + "../../../../test") # :nodoc:
-    private_constant :DEFAULT_TEST_DIR
-    ##
     # Assertion base class
 
     class AssertionFailedError < Exception; end
@@ -186,7 +183,6 @@ module Test
 
     module Options # :nodoc: all
       attr_reader :option_parser, :verbose
-      attr_writer :default_dir
 
       def initialize(*, &block)
         @init_hook = block
@@ -195,7 +191,6 @@ module Test
         @help = nil
         @order = nil
         @verbose = false
-        @default_dir = nil
         @option_parser = OptionParser.new
         @option_warnings = []
         super(&nil)
@@ -208,16 +203,16 @@ module Test
         setup_options(@option_parser, options)
         @option_parser.parse!(args)
         orig_args -= args
+        @run_options = orig_args
         args = @init_hook.call(self, args, options) if @init_hook
         non_options(args, options)
-        @run_options = orig_args
 
         order = options[:test_order]
         if seed = options[:seed]
           order ||= :random
         elsif (order ||= :random) == :random
           seed = options[:seed] = rand(0x10000)
-          orig_args.unshift "--seed=#{seed}"
+          @run_options.unshift "--seed=#{seed}"
         end
         Test::Unit::TestCase.test_order = order if order
         order = Test::Unit::TestCase.test_order
@@ -227,12 +222,8 @@ module Test
           "  " + (s =~ /[\s|&<>$()]/ ? s.inspect : s)
         }.join("\n")
 
-        if @orig_files.any?
-          custom_basedirs = options[:base_directories]
-          custom_basedirs = nil if custom_basedirs == [@default_dir]
-          unless custom_basedirs && @orig_files == [@default_dir]
-            @help << "\n  #{@orig_files.inspect}\n"
-          end
+        if @orig_files.any? && @orig_files != [options[:base_directory]]
+          @help << "\n  #{@orig_files.inspect}\n"
         end
 
         @options = options # first time @options is set
@@ -881,7 +872,9 @@ module Test
             worker = launch_worker
           end
           worker.run(task, type)
-          @test_count += 1
+          unless @options[:job_status] == :replace
+            @test_count += 1
+          end
 
           jobs_status(worker: worker)
         when /^_R_: start (.+?)$/ # start of method, set current test case of worker
@@ -890,6 +883,10 @@ module Test
           last_test_assertions = ary[2]
           worker.suite_assertion_count += last_test_assertions
           worker.suite_test_count += 1
+        when /^_R_: running file ([0-9]+)$/
+          if @options[:job_status] != :replace
+            @total_tests = $1
+          end
         when /^_R_: done (.+?)$/ # done running suite, collect results
           begin
             r = Marshal.load($1.unpack1("m"))
@@ -921,14 +918,25 @@ module Test
           record(fake_class(r[0]), *r[1..-1])
         when /^_R_: p (.+?)$/ # test runner output, like '.' or 'E'
           match = $1
-          if match =~ /\A([EF]) .+/ # error or failure in non-verbose mode
-            ef_match = $1
-            msg = match[1..-1]
-            msg = msg.unpack1("m")
+          if ((!@verbose) && match =~ /\A([EFS]) (.+)\z/) ||
+              (@verbose && match =~ /\A(.+? s = ([EFS])) \|\| (.+?)\z/) # error or failure in non-verbose mode
+            if @verbose
+              ef_match = $2
+              msg = $1 + "\n"
+              err = $3.unpack1("m")
+            else
+              ef_match = $1
+              msg = $1
+              err = $2.unpack1("m")
+            end
             unless @interrupt
-              @report << msg
+              @report << err
               del_status_line
-              efs_change = print(ef_match) # print the error or failure
+              if @verbose
+                efs_change = print_verbose(msg) # print the error or failure
+              else
+                efs_change = print(msg) # print the error or failure
+              end
               if efs_change != [0,0,0]
                 worker.suite_errors += efs_change[0]
                 worker.suite_failures += efs_change[1]
@@ -940,7 +948,11 @@ module Test
             unless @interrupt
               del_status_line
               status_msg = match.unpack1("m")
-              efs_change = print status_msg # '.' or 'S' or long result if verbose mode
+              if @verbose
+                efs_change = print_verbose status_msg # long msg
+              else
+                efs_change = print status_msg # '.' or 'S' or long result if verbose mode
+              end
               if efs_change != [0,0,0]
                 worker.suite_errors += efs_change[0]
                 worker.suite_failures += efs_change[1]
@@ -1379,12 +1391,18 @@ module Test
 
       def succeed
         raise if worker_process?
+        if @verbose
+          $stdout.print " = ."
+        end
         del_status_line
       end
 
-      def failed(s)
+      def failed(s, status: 'F')
         raise if worker_process?
         return if @options[:report_after]
+        if s && @verbose
+          $stdout.print " = #{status}"
+        end
         output_error_messages
         @report.clear
       end
@@ -1465,7 +1483,11 @@ module Test
       def _prepare_run_suites(suites, type)
         raise if worker_process?
         @options[:job_status] ||= :replace if use_tty? && !@verbose
-        @options[:job_status] ||= :normal
+        if @verbose && @options[:parallel]
+          @options[:job_status] ||= (use_tty? ? :replace : :none)
+        else
+          @options[:job_status] ||= :normal
+        end
         case @options[:color]
         when :always
           color = true
@@ -1476,13 +1498,12 @@ module Test
         end
         colors_file = File.expand_path(File.join(__dir__, "../../colors"))
         @colorize ||= Colorize.new(color, colors_file: colors_file)
-        if color or @options[:job_status] == :replace
-          @verbose = !@options[:parallel]
-        end
         @output = Output.new(self) unless @options[:testing_parallel]
         filter = @options[:test_name_filter] || // # match anything
         type = "#{type}_methods"
-        total = suites.inject(0) {|n, suite| n + suite.send(type).grep(filter).size}
+        total = suites.inject(0) do |n, suite|
+          n + suite.send(type).map { |test| "#{suite}##{test}" }.grep(filter).size
+        end
         @test_count = 0
         @total_tests = total.to_s(10)
         @report.clear
@@ -1503,8 +1524,6 @@ module Test
 
         opts.separator "status line options:"
 
-        # if tty, default is :replace
-        # otherwise, default is :normal
         options[:job_status] = nil
         options[:color] = :auto
 
@@ -1552,14 +1571,35 @@ module Test
             runner.succeed
           # Ex: "F"
           when /\A\.*([EFS][EFS.]*)\z/
-            runner.failed(s)
             efs = $1
+            runner.failed(s, status: efs)
             return [efs.count('E'), efs.count('F'), efs.count('S')]
           else
             # Warnings, etc.
             $stdout.print(s)
           end
           return NO_REPORT_CHANGE
+        end
+
+        def print_verbose(s)
+          case s
+          # Ex: "MyTest#test_something = 0.50 s = ."
+          when /\A(.+?) (= [0-9.]+ s) = ([EFS.])/
+            efsp = $3
+            match = $1
+            time = $2
+            test = match =~ /(.+#.+)/
+            runner.new_test($1)
+            runner.add_status(time)
+            if efsp == '.'
+              runner.succeed
+            else
+              runner.failed(efsp, status: efsp)
+              [efsp.count('F'), efsp.count('E'), efsp.count('S')]
+            end
+          else
+            raise ArgumentError, "msg #{s.inspect} doesn't match in print_verbose"
+          end
         end
       end
     end
@@ -1603,10 +1643,15 @@ module Test
       def setup_options(parser, options)
         super
         parser.separator "globbing options:"
+        # Defaults to ($ruby_srcdir)/test
         parser.on '-B', '--base-directory DIR', 'Base directory to glob' do |dir|
           raise OptionParser::InvalidArgument, "not a directory: #{dir}" unless File.directory?(dir)
+          if options[:base_directory]
+            raise OptionParser::InvalidArgument, "Can't give multiple base directories"
+          end
           dir = File.expand_path(dir) unless File.absolute_path?(dir)
-          (options[:base_directories] ||= []) << dir
+          $LOAD_PATH.unshift(dir) unless $:.include?(dir)
+          options[:base_directory] = dir
         end
         # example: -x test_hash
         parser.on '-x', '--exclude PATTERN', 'Exclude test files on basic pattern. Ex: -x test_gc' do |pattern|
@@ -1620,11 +1665,19 @@ module Test
 
       def complement_test_name f, orig_f
         basename = File.basename(f)
-
+        dirname = File.dirname(f)
         if /\.rb\z/ !~ basename
-          return File.join(File.dirname(f), basename+'.rb')
+          if dirname == '.'
+            return basename+'.rb'
+          else
+            return File.join(dirname, basename+'.rb')
+          end
         elsif /\Atest_/ !~ basename
-          return File.join(File.dirname(f), 'test_'+basename)
+          if dirname == '.'
+            return 'test_' + basename
+          else
+            return File.join(dirname, 'test_'+basename)
+          end
         end if f.end_with?(basename) # otherwise basename is dirname/
 
         raise ArgumentError, "file not found: #{orig_f}"
@@ -1636,24 +1689,19 @@ module Test
         if worker_process?
           return super(files, options)
         end
-        paths = [options[:base_directories], nil].flatten.uniq
+        base_paths = [options[:base_directory], nil]
         if exclude_pats = options[:exclude_file_patterns]
           exclude_re = Regexp.union(exclude_pats.map {|r| %r"#{r}"})
         end
-        custom_basedirs = options[:base_directories] if options[:base_directories] != [DEFAULT_TEST_DIR]
-        if custom_basedirs && files == [DEFAULT_TEST_DIR]
-          # custom basedirs given, no files given
-          files.replace custom_basedirs.dup
-        elsif custom_basedirs && files != [DEFAULT_TEST_DIR]
-          # files and custom basedirs given
-          files.concat custom_basedirs
-          files.uniq!
+        if files != [base_paths[0]] && files.size >= 2
+          files.delete base_paths[0]
+          @orig_files.delete base_paths[0]
         end
         files.map! do |f|
           f = f.tr(File::ALT_SEPARATOR, File::SEPARATOR) if File::ALT_SEPARATOR
           orig_f = f
           while true
-            ret = paths.any? do |prefix|
+            found = base_paths.any? do |prefix|
               abs_file_no_prefix = false
               if prefix
                 if File.absolute_path?(f)
@@ -1665,12 +1713,7 @@ module Test
                     if f.empty?
                       prefix
                     else
-                      path_made = "#{prefix}/#{f}"
-                      if File.exist?(File.expand_path(path_made))
-                        path_made
-                      else
-                        next
-                      end
+                      "#{prefix}/#{f}"
                     end
                 end
               else
@@ -1709,10 +1752,10 @@ module Test
               end
             end # paths.any?
 
-            if !ret
+            if !found
               f = complement_test_name(f, orig_f)
             else
-              break ret
+              break found
             end
           end # while
         end
@@ -2137,8 +2180,6 @@ module Test
         end
       end
 
-      private
-
       def puts *a # :nodoc:
         output.puts(*a)
       end
@@ -2146,6 +2187,13 @@ module Test
       def print *a # :nodoc:
         output.print(*a)
       end
+
+      def print_verbose *a # :nodoc:
+        output.print_verbose *a
+      end
+
+      private
+
 
       def exit status = 0 # :nodoc:
         # stdout piped to file
@@ -2355,18 +2403,16 @@ module Test
         @force_standalone = force_standalone
         @to_run = nil
         @runner = Runner.new do |runner, files, options|
-          bases = options[:base_directories] ||= [default_dir]
-          bases = bases.map do |base|
-            File.absolute_path?(base) ? base : File.expand_path(base)
+          if !options[:base_directory]
+            base = options[:base_directory] = default_dir
+            $LOAD_PATH.unshift base
+          else
+            base = options[:base_directory]
           end
-          files << default_dir if files.empty? and default_dir
+          base = File.absolute_path?(base) ? base : File.expand_path(base)
+          files << base
           @to_run = files
           yield self if block_given?
-          bases.each do |base|
-            $LOAD_PATH.unshift base if base
-          end
-          $LOAD_PATH.unshift DEFAULT_TEST_DIR unless $:.include?(DEFAULT_TEST_DIR)
-          runner.default_dir = default_dir
           files
         end
         Runner.runner = @runner
@@ -2383,7 +2429,7 @@ module Test
 
       def run
         if @force_standalone and not process_args(@argv)
-          $stderr.puts "No test files to run"
+          $stderr.puts "No test files to run!"
           abort @options.banner
         end
         @runner.run(@argv) || true
@@ -2401,8 +2447,8 @@ module Test
     class ProxyError < StandardError # :nodoc: all
       attr_reader :message, :backtrace, :error_class
 
-      def initialize(ex)
-        @message = ex.message
+      def initialize(ex, msg = nil)
+        @message = msg || ex.message
         @backtrace = ex.backtrace
         @error_class = ex.class.name
       end
