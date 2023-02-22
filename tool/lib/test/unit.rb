@@ -131,7 +131,9 @@ module Test
 
         # XXX: remove to use MJITFirst
         def group(list)
-          list
+          slow, others = list.partition {|e| /TestGc|TestGCCompact|TestMJIT/ =~ e}
+          slow + others
+          #list
         end
 
         private
@@ -262,8 +264,8 @@ module Test
           options[:test_order] = a
         end
 
-        opts.on('--without-leakchecker', "Turn off leakchecker") do
-          options[:without_leakchecker] = true
+        opts.on('--no-leakchecker', "Turn off leakchecker") do
+          options[:no_leakchecker] = true
         end
 
         opts.on('--report-failures-after', "Report failures only after all tests have ran instead of immediately") do
@@ -1150,7 +1152,7 @@ module Test
               puts "\n"
               @verbose = @options[:verbose]
               failed_suites.map! {|r| ::Object.const_get(r[:testcase])}
-              _run_suites(failed_suites, type)
+              _run_suites(failed_suites.map(&:name), type)
             end
           end
           # Retry suites that timed out in this process
@@ -1175,7 +1177,7 @@ module Test
               @options[:verbose] = @verbose = true
               @options[:job_status] = :normal
               result.reject! { |ary| ary[2] == :timeout }
-              result.concat _run_suites(timed_out_suites, type)
+              result.concat _run_suites(timed_out_suites.map(&:name), type)
               @options[:verbose] = @verbose = old_verbose
               @options[:job_status] = old_job_status
             end
@@ -1198,17 +1200,17 @@ module Test
         end
       end
 
-      def _run_suites suites, type
-        _prepare_run_suites(suites, type)
+      def _run_suites suite_names, type
+        _prepare_run_suites(suite_names, type)
         result = []
         GC.start
         if @options[:parallel]
-          _run_parallel suites, type, result
+          _run_parallel suite_names, type, result
         else
-          suites.each {|suite|
+          suite_names.each {|suite_name|
             begin
-              result << _run_suite(suite, type)
-              gc_suite(suite, type) if can_gc_suite?(suite, type)
+              result << _run_suite(suite_name, type)
+              gc_suite(suite_name, type) if can_gc_suite?(suite_name, type)
             rescue Interrupt => e
               result << [@suite_test_count, @suite_assertion_count]
               @interrupt = e
@@ -1216,6 +1218,7 @@ module Test
             end
           }
         end
+
         del_status_line
         result
       end
@@ -1240,6 +1243,67 @@ module Test
       end
     end
 
+    module SuiteGC # :nodoc: all
+      # GC a test class once it ran.
+      #
+      # There are some situations where we don't want to GC a test class, such
+      # as when 1 test class inherits from another. Most of these cases
+      # (including that one) are taken care of automatically and nothing needs
+      # to be done, but there is one situation which isn't. For example:
+      #
+      # class MyTest < Test::Unit::TestCase
+      #   class Error < StandardError; end
+      #   def test_stuff
+      #     ...
+      #   end
+      # end
+      # class MyTest2 < Test::Unit::TestCase
+      #   def test_other_stuff
+      #     error = MyTest::Error # could be invalid, MyTest constant could be gone
+      #     assert_raise error do ... end
+      #   end
+      # end
+      #
+      # To avoid this situation, nest MyTest2 inside MyTest OR
+      # call MyTest.make_uncollectible!
+      private
+
+      # Remove the constant and all references to the suite (test class) after we're done with it.
+      def gc_suite(suite_name, type)
+        name = suite_name
+        suite = Object.const_get(name)
+        if name.index('::')
+          # "My::A::Class" => "Class"
+          base_name = name[name.rindex("::")+2..-1]
+          parent_name = name[0..name.rindex("::")-1]
+          parent_mod = Object.const_get(parent_name)
+        else
+          base_name = name
+          parent_mod = Object
+        end
+        #$stderr.puts "Making collectible: #{suite.name}"
+        parent_mod.send(:remove_const, base_name.to_sym)
+        Test::Unit::TestCase._make_collectible(suite)
+        Test::Unit::TestCase.reset_current
+        Test::Unit::TestCase._collected_suites << base_name
+        #[suite.object_id, suite.name]
+        true
+      end
+
+      def can_gc_suite?(suite_name, type)
+        if @repeat_count && @repeat_count > 1
+          return false
+        end
+        if suite_name == "Test::Unit::TestCase"
+          return false
+        end
+        if Test::Unit::TestCase._uncollectible_suites.include?(suite_name)
+          return false
+        end
+        true
+      end
+    end
+
     module Skipping # :nodoc: all
       private
 
@@ -1259,7 +1323,7 @@ module Test
         end
       end
 
-      def _run_suites(suites, type)
+      def _run_suites(suite_names, type)
         result = super
         @report.reject!{|r| r.start_with? "Skipped:" } if @options[:hide_skip]
         @report.sort_by!{|r| r.start_with?("Skipped:") ? 0 : \
@@ -1483,7 +1547,7 @@ module Test
         update_status(status_line) or (puts; nil)
       end
 
-      def _prepare_run_suites(suites, type)
+      def _prepare_run_suites(suite_names, type)
         raise if worker_process?
         @options[:job_status] ||= :replace if use_tty? && !@verbose
         @options[:job_status] ||= :normal
@@ -1500,7 +1564,8 @@ module Test
         @output = Output.new(self) unless @options[:testing_parallel]
         filter = @options[:test_name_filter] || // # match anything
         type = "#{type}_methods"
-        total = suites.inject(0) do |n, suite|
+        total = suite_names.inject(0) do |n, suite_name|
+          suite =  Object.const_get(suite_name)
           n + suite.send(type).map { |test| "#{suite}##{test}" }.grep(filter).size
         end
         @test_count = 0
@@ -1936,9 +2001,9 @@ module Test
         end
       end
 
-      def _run_suite(suite, type)
-        if excluded = ExcludedMethods.load(@options[:excludes], suite.name)
-          (@excludes[[suite.name, type]] ||= {}).merge!(excluded.excludes)
+      def _run_suite(suite_name, type)
+        if excluded = ExcludedMethods.load(@options[:excludes], suite_name)
+          (@excludes[[suite_name, type]] ||= {}).merge!(excluded.excludes)
         end
         super
       end
@@ -2221,10 +2286,16 @@ module Test
       # Run all suites for a given +type+
 
       def _run_anything type
-        suites = Test::Unit::TestCase.send "#{type}_suites"
-        return if suites.empty?
+        suite_names = Test::Unit::TestCase.send("#{type}_suites").map(&:name)
+        if suite_names.include?(nil)
+          $stderr.puts "Some subclasses of Test::Unit::TestCase have no name!"
+          abort "Cannot continue"
+        end
 
-        suites = @order.sort_by_name(suites)
+        return if suite_names.empty?
+
+        suite_names = @order.sort_by_string(suite_names)
+        suite_names = @order.group(suite_names)
 
         puts
         puts "# Running #{type}s:"
@@ -2239,7 +2310,7 @@ module Test
         begin
           start = Time.now
 
-          results = _run_suites suites, type
+          results = _run_suites suite_names, type
 
           @test_count      = results.inject(0) { |sum, (tc, _)| sum + tc }
           @assertion_count = results.inject(0) { |sum, (_, ac)| sum + ac }
@@ -2271,12 +2342,19 @@ module Test
       ##
       # Run a single +suite+ for a given +type+.
 
-      def _run_suite suite, type
+      def _run_suite suite_name, type
         header = "#{type}_suite_header"
         puts send(header, suite) if respond_to? header
 
         filter = @options[:test_name_filter]
 
+        begin
+          suite ||= Object.const_get(suite_name)
+        rescue NameError
+          del_status_line
+          $stderr.puts "#{suite_name} got collected! Bug in Test::Unit, please report."
+          exit 1
+        end
         all_test_methods = suite.send "#{type}_methods"
         if filter
           all_test_methods.select! {|method|
@@ -2294,11 +2372,11 @@ module Test
         use_leakchecker = true
         if defined?(RubyVM::MJIT) && RubyVM::MJIT.enabled? # compiler process is wrongly considered as leak
           use_leakchecker = false
-        elsif @options[:without_leakchecker] || (worker_process? && @options[:silence_worker_output])
+        elsif @options[:no_leakchecker] || (worker_process? && @options[:silence_worker_output])
           use_leakchecker = false
         end
 
-        unless use_leakchecker
+        if use_leakchecker
           leakchecker = LeakChecker.new(output: self.class.output, use_buffered_output: worker_process?)
         end
         if ENV["LEAK_CHECKER_TRACE_OBJECT_ALLOCATION"]
@@ -2312,7 +2390,11 @@ module Test
           inst = suite.new(method)
           _start_method(inst)
 
-          print "#{suite}##{method} = " if @verbose
+          if @verbose
+            print "#{suite}##{method} = "
+          else
+            new_test("#{suite}##{method}") unless worker_process?
+          end
 
           start_time = Time.now if @verbose
           result =
@@ -2329,7 +2411,7 @@ module Test
           puts if @verbose
           self.output.flush
 
-          unless use_leakchecker
+          if use_leakchecker
             leakchecker.check("#{inst.class}\##{inst.__name__}")
           end
 
@@ -2387,6 +2469,7 @@ module Test
       prepend Test::Unit::ExcludesOption
       prepend Test::Unit::TimeoutOption
       prepend Test::Unit::RunCount
+      prepend Test::Unit::SuiteGC
 
       @@stop_auto_run = false
       def self.autorun

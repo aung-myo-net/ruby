@@ -222,8 +222,13 @@ module Test
         @__io__
       end
 
+      # current TestCase object being run
       def self.current # :nodoc:
         @@current # FIX: make thread local
+      end
+
+      def self.reset_current
+        @@current = nil
       end
 
       def self.reset # :nodoc:
@@ -232,9 +237,37 @@ module Test
       end
       reset
 
+      @@uncollectible_suites = []
+      @@collected_suites = []
+      # self is the super class
+      # klass is the inherited klass
       def self.inherited klass # :nodoc:
         @@test_suites[klass] = true
         klass.instance_variable_set("@test_methods", {})
+        # If test class x gets inherited by other test classes, we don't collect x
+        if self != Test::Unit::TestCase
+          @@uncollectible_suites << self.name if self.name && !@@uncollectible_suites.include?(self.name)
+        end
+        _klass = klass
+        # if:
+        # class A < Test::Unit::TestCase
+        #   class B < Test::Unit::TestCase; end
+        # end
+        # then: upon seeing class B, we mark A as uncollectible, since B could run after A
+        # and we need to get B from its full class name before running it.
+        while _klass
+          if _klass.name && _klass.name.index('::')
+            parent_name = _klass.name[0..._klass.name.rindex('::')]
+            parent_mod = Object.const_get(parent_name)
+            if parent_mod.ancestors.include?(Test::Unit::TestCase)
+              @@uncollectible_suites << parent_name if !@@uncollectible_suites.include?(parent_name)
+              #$stderr.puts "Skipping collecting #{parent_name}"
+            end
+            _klass = parent_mod
+          else
+            break
+          end
+        end
         super
       end
 
@@ -242,6 +275,76 @@ module Test
 
       class << self
         attr_writer :test_order
+        def _collected_suites
+          @@collected_suites
+        end
+        def _uncollectible_suites
+          @@uncollectible_suites
+        end
+        def _make_collectible(suite)
+          @@test_suites.delete(suite)
+        end
+        def make_uncollectible!
+          return unless self.name
+          @@uncollectible_suites << self.name unless @@uncollectible_suites.include?(self.name)
+        end
+        alias old_const_missing const_missing
+        def const_missing(name)
+          Test::Unit::TestCase.collected_warning(name)
+          old_const_missing(name)
+        end
+        def collected_warning(name)
+          @_collected_warnings ||= Hash.new { |h,k| h[k] = {} }
+          @_collected_warnings.delete_if { |k,v| k != @@current.hash }
+          if Test::Unit::TestCase._collected_suites.include?(name.to_s) &&
+              !@_collected_warnings[@@current.hash][name]
+            $stderr.puts "Error: class #{name} has been collected (test suite GC). Consider:\n" +
+              "class #{name}\n" +
+              "  self.make_uncollectible!\n" +
+              "end"
+            # don't output same message more than once in same testcase
+            @_collected_warnings[@@current.hash][name] = true
+          end
+        end
+      end
+
+      class ::Module # :nodoc: all
+        EnvUtil.suppress_warning do # method redefined
+          alias included_without_collection_warning included
+          # Give good error messages when getting NameError for collected
+          # suites, or constants within collected suites.
+          # This catches the following case:
+=begin
+            class MyTest < Test::Unit::TestCase
+               ...
+            end
+            class MyTest2 < Test::Unit::TestCase
+              module M
+                def test_mine
+                  # MyTest could be GC'd
+                  assert MyTest::Error.ancestors.include?(StandardError)
+                end
+              end
+              include M
+            end
+=end
+          def included(mod)
+            if frozen?
+              return included_without_collection_warning(mod)
+            end
+            @_const_missing_with_collect_warning ||= nil
+            if mod.is_a?(Class) && mod.ancestors.include?(Test::Unit::TestCase) &&
+                @_const_missing_with_collect_warning.nil?
+              orig = self.method(:const_missing)
+              define_singleton_method(:const_missing) do |name|
+                Test::Unit::TestCase.collected_warning(name)
+                orig.call(name)
+              end
+              @_const_missing_with_collect_warning = true
+            end
+            included_without_collection_warning(mod)
+          end
+        end
       end
 
       def self.test_order

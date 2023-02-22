@@ -4,6 +4,11 @@ require "error_highlight"
 require "tempfile"
 
 class ErrorHighlightTest < Test::Unit::TestCase
+  # Test::Unit::TestCase.const_missing messes up error messages for NameError
+  class << self
+    alias const_missing old_const_missing
+  end
+
   class DummyFormatter
     def self.message_for(corrections)
       ""

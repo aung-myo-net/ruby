@@ -32,9 +32,9 @@ module Test
         io
       end
 
-      def _run_suites(suites, type) # :nodoc:
-        suites.each do |suite|
-          _run_suite(suite, type)
+      def _run_suites(suite_names, type) # :nodoc:
+        suite_names.each do |suite_name|
+          _run_suite(suite_name, type)
         end
       end
 
@@ -42,7 +42,7 @@ module Test
         _report "start", Marshal.dump([inst.class.name, inst.__name__, @last_test_assertions])
       end
 
-      def _run_suite(suite, type) # :nodoc:
+      def _run_suite(suite_name, type) # :nodoc:
         @partial_report = []
         @last_test_assertions = 0
         orig_testout = Test::Unit::Runner.output
@@ -74,7 +74,7 @@ module Test
         @skips = 0
 
         begin
-          result = orig_run_suite(suite, type)
+          result = orig_run_suite(suite_name, type)
         rescue Interrupt
           # Using a terminal, interrupt signal by ctrl-c is sent to all processes in
           # foreground process group, so even child processes get the signal.
@@ -99,7 +99,7 @@ module Test
         @partial_report = nil
         result << [@errors,@failures,@skips]
         result << ($: - @old_loadpath)
-        result << suite.name
+        result << suite_name
 
         _report "done", Marshal.dump(result)
         return result
@@ -187,7 +187,7 @@ module Test
 
               _report "running file #{test_methods_size.to_s(10)}"
 
-              _run_suites this_suite_ary, suite_type.to_sym
+              _run_suites this_suite_ary.map(&:name), suite_type.to_sym
 
               if @need_exit
                 _report "bye"
