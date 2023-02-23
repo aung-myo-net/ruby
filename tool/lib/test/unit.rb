@@ -18,6 +18,7 @@ end
 require_relative '../envutil'
 require_relative '../colorize'
 require_relative '../leakchecker'
+require_relative '../process_getmem'
 require_relative '../test/unit/testcase'
 require 'optparse'
 
@@ -90,7 +91,7 @@ module Test
       module MJITFirst
         def group(list)
           # MJIT first
-          mjit, others = list.partition {|e| /test_mjit/ =~ e}
+          mjit, others = list.partition {|e| /TestMJIT/ =~ e}
           mjit + others
         end
       end
@@ -131,8 +132,9 @@ module Test
 
         # XXX: remove to use MJITFirst
         def group(list)
-          slow, others = list.partition {|e| /TestGc|TestGCCompact|TestMJIT/ =~ e}
-          slow + others
+          list = super(list)
+          mem, others = list.partition {|e| /TestGc|TestGCCompact|TestUnicodeNormalize|TestDRb|DRbTests::|TestProcess|TestObjSpace|TestZlib|TestM17N/ =~ e}
+          others + mem
           #list
         end
 
@@ -1203,14 +1205,22 @@ module Test
       def _run_suites suite_names, type
         _prepare_run_suites(suite_names, type)
         result = []
-        GC.start
+        #suite_ids = []
+        #mem = GetProcessMem.new
+        #$stderr.puts "mem before suites"
+        #$stderr.puts mem.inspect
         if @options[:parallel]
           _run_parallel suite_names, type, result
         else
           suite_names.each {|suite_name|
             begin
               result << _run_suite(suite_name, type)
-              gc_suite(suite_name, type) if can_gc_suite?(suite_name, type)
+              _obj_id, _name = gc_suite(suite_name, type) if can_gc_suite?(suite_name, type)
+              #suite_ids << obj_id
+              #if result.last != [0,0]
+                #10.times { GC.start }
+                #$stderr.puts "After #{suite_name} #{GetProcessMem.new.inspect}"
+              #end
             rescue Interrupt => e
               result << [@suite_test_count, @suite_assertion_count]
               @interrupt = e
@@ -1219,8 +1229,27 @@ module Test
           }
         end
 
+        #report_uncollected_suites(suite_ids)
+
         del_status_line
         result
+      end
+
+      def report_uncollected_suites(suite_ids)
+        $stderr.puts "Uncollected report on #{suite_ids.size} suites:"
+        uncollected = 0
+        10.times { GC.start }
+        suite_ids.each do |sid|
+          ref = ObjectSpace._id2ref(sid) rescue nil
+          next if ref.nil?
+          if ref.is_a?(Class) && ref.ancestors.include?(Test::Unit::TestCase)
+            $stderr.puts "#{ref} is uncollected"
+            uncollected += 1
+          end
+        end
+        if uncollected == 0
+          $stderr.puts "All suites collected"
+        end
       end
 
       # Report on all suites ran
@@ -1286,8 +1315,8 @@ module Test
         Test::Unit::TestCase._make_collectible(suite)
         Test::Unit::TestCase.reset_current
         Test::Unit::TestCase._collected_suites << base_name
-        #[suite.object_id, suite.name]
-        true
+        [suite.object_id, suite.name]
+        #true
       end
 
       def can_gc_suite?(suite_name, type)
@@ -1723,7 +1752,7 @@ module Test
         # example: -x test_hash
         parser.on '-x', '--exclude PATTERN', 'Exclude test files on basic pattern. Ex: -x test_gc' do |pattern|
           # NOTE: -x /test_hash/ does not work. This is not same format as --name option.
-          if /\A\// =~ pattern && (!File.exist?(pattern) || pattern == '//')
+          if /\A\/[^\/]*\/i?\z/ =~ pattern && (!File.exist?(pattern) || pattern == '//')
             @option_warnings << "Warning: -x pattern should be a basic string pattern, / is treated as part of file path"
           end
           (options[:exclude_file_patterns] ||= []) << pattern
@@ -2047,7 +2076,7 @@ module Test
 
       # Modules are prepended to this class so this is the last in the chain
       def initialize # :nodoc:
-        @report = []
+        @report = [] # list of error messages (Strings)
         @errors = @failures = @skips = 0
         @test_count = @assertion_count = 0
         @suite_test_count = @suite_assertion_count = 0

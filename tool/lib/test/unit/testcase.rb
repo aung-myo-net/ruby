@@ -239,8 +239,7 @@ module Test
 
       @@uncollectible_suites = []
       @@collected_suites = []
-      # self is the super class
-      # klass is the inherited klass
+      # Reminder: self is the super class, klass is the inherited class
       def self.inherited klass # :nodoc:
         @@test_suites[klass] = true
         klass.instance_variable_set("@test_methods", {})
@@ -248,19 +247,19 @@ module Test
         if self != Test::Unit::TestCase
           @@uncollectible_suites << self.name if self.name && !@@uncollectible_suites.include?(self.name)
         end
-        _klass = klass
         # if:
         # class A < Test::Unit::TestCase
         #   class B < Test::Unit::TestCase; end
         # end
         # then: upon seeing class B, we mark A as uncollectible, since B could run after A
         # and we need to get B from its full class name before running it.
+        _klass = klass
         while _klass
           if _klass.name && _klass.name.index('::')
             parent_name = _klass.name[0..._klass.name.rindex('::')]
             parent_mod = Object.const_get(parent_name)
             if parent_mod.ancestors.include?(Test::Unit::TestCase)
-              @@uncollectible_suites << parent_name if !@@uncollectible_suites.include?(parent_name)
+              @@uncollectible_suites << parent_name unless @@uncollectible_suites.include?(parent_name)
               #$stderr.puts "Skipping collecting #{parent_name}"
             end
             _klass = parent_mod
@@ -296,8 +295,8 @@ module Test
         def collected_warning(name)
           @_collected_warnings ||= Hash.new { |h,k| h[k] = {} }
           @_collected_warnings.delete_if { |k,v| k != @@current.hash }
-          if Test::Unit::TestCase._collected_suites.include?(name.to_s) &&
-              !@_collected_warnings[@@current.hash][name]
+          name = name.to_s
+          if _collected_suites.include?(name) && !@_collected_warnings[@@current.hash][name]
             $stderr.puts "Error: class #{name} has been collected (test suite GC). Consider:\n" +
               "class #{name}\n" +
               "  self.make_uncollectible!\n" +
@@ -313,7 +312,8 @@ module Test
           alias included_without_collection_warning included
           # Give good error messages when getting NameError for collected
           # suites, or constants within collected suites.
-          # This catches the following case:
+          # This catches the following case, and gives a warning that MyTest
+          # has been collected.
 =begin
             class MyTest < Test::Unit::TestCase
                ...
@@ -328,6 +328,9 @@ module Test
               include M
             end
 =end
+          # The reason we don't redefine Module#const_missing is because some tests rely
+          # on it not being overridden. So we only override it for modules
+          # that are included in the test classes.
           def included(mod)
             if frozen?
               return included_without_collection_warning(mod)
